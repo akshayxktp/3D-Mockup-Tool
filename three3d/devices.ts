@@ -1,0 +1,120 @@
+import { use3DStore } from '@/store/use3DStore';
+
+// ── Device library (Mockup mode) ────────────────────────────────────────────
+// Real device meshes + finish presets, mirrored from the reference tool's own
+// device-lab registry (the product this feature is modelled after) so picking a
+// device and a finish here behaves the way it does there. `fitHeight` is the
+// reference's own tuned camera-fit size for each mesh — reused verbatim so each
+// device frames correctly on first load.
+export interface DeviceFinish { key: string; label: string; hex: string; }
+
+// Which screen an uploaded asset belongs to. Assets are held PER SLOT, not per
+// device, so one phone screenshot serves every phone and switching device keeps
+// the right artwork on screen — the same model the reference tool uses.
+export type ScreenSlot = 'phone' | 'laptop' | 'tablet' | 'display';
+
+export const SLOT_LABELS: Record<ScreenSlot, string> = {
+  phone: 'Phone screen',
+  laptop: 'Laptop screen',
+  tablet: 'Tablet screen',
+  display: 'Display screen',
+};
+
+export interface DeviceDef {
+  key: string;
+  label: string;
+  modelUrl: string;        // local copy, served from /public/3d/devices
+  fitHeight: number;       // world-size the model is fitted to (see three3d/frame.ts)
+  screenAspect: number;    // the "Screen" mesh's own w/h — used to cover-fit uploaded media
+  screenCornerFrac: number; // corner radius as a fraction of the screen's short side
+  screenTextureFlipY?: boolean; // bundled meshes do not all share the same UV vertical direction
+  // Some bundled meshes were authored with the screen's UV axes SWAPPED, which
+  // lands the content sideways — and mirrored, because swapping axes is a
+  // reflection, not a rotation. `screenTextureFlipY` cannot express that. The
+  // fix reflects the composite back along the same diagonal ('main': u<->v) or
+  // the anti-diagonal ('anti'), which is self-inverse, so applying the measured
+  // reflection cancels it. Measured per device with an orientation target —
+  // see scripts/_probe_screen_orientation.cjs.
+  screenTextureTranspose?: 'main' | 'anti';
+  statusBarScaleX?: number; // compensates authored screen-UV stretching for the system overlay only
+  slot: ScreenSlot;
+  // The panel's real native pixels, shown in the UI so a screenshot can be
+  // prepared at the right size. Verified against Apple's own tech specs.
+  screenPx: [number, number];
+  finishes: DeviceFinish[];
+}
+
+export const DEVICES: DeviceDef[] = [
+  {
+    key: 'iphone17pro', label: 'iPhone 17 Pro', modelUrl: '/3d/devices/iphone17pro-clean.glb', fitHeight: 2.077,
+    screenAspect: 0.462, screenCornerFrac: 0.151, slot: 'phone', screenPx: [1206, 2622],
+    // Cosmic Orange stays first: markEnclosureMaterials() in three3d/mockup.ts
+    // treats finishes[0] as the colour the mesh was authored in, and finds the
+    // enclosure by matching that hue. Reordering this list would break the
+    // recolouring for every finish.
+    finishes: [
+      { key: 'cosmic', label: 'Cosmic Orange', hex: '#db6018' },
+      { key: 'silver', label: 'Silver', hex: '#d9dadc' },
+      { key: 'blue', label: 'Deep Blue', hex: '#2c3a4f' },
+      { key: 'skyblue', label: 'Sky Blue', hex: '#8aaedb' },
+      { key: 'plum', label: 'Plum', hex: '#712c4e' },
+      { key: 'black', label: 'Black', hex: '#1f2022' },
+    ],
+  },
+  {
+    key: 'iphoneair', label: 'iPhone Air', modelUrl: '/3d/devices/iphoneair.glb', fitHeight: 2.077,
+    screenAspect: 0.46, screenCornerFrac: 0.124, screenTextureFlipY: false, statusBarScaleX: 0.9, slot: 'phone', screenPx: [1260, 2736],
+    finishes: [
+      { key: 'skyblue', label: 'Sky Blue', hex: '#a9c3d6' },
+      { key: 'black', label: 'Black', hex: '#1f2022' },
+    ],
+  },
+  {
+    key: 'macbook14', label: 'MacBook Pro 14"', modelUrl: '/3d/devices/macbook14-clean.glb', fitHeight: 1.3,
+    screenAspect: 1.538, screenCornerFrac: 0.0086, screenTextureFlipY: false, slot: 'laptop', screenPx: [3024, 1964],
+    finishes: [
+      { key: 'spaceblack', label: 'Space Black', hex: '#565457' },
+      { key: 'silver', label: 'Silver', hex: '#c6c7c8' },
+    ],
+  },
+  {
+    key: 'ipadpro', label: 'iPad Pro', modelUrl: '/3d/devices/ipadpro.glb', fitHeight: 1.7,
+    screenAspect: 1.33, screenCornerFrac: 0.014, screenTextureTranspose: 'anti', slot: 'tablet', screenPx: [2752, 2064],
+    finishes: [
+      { key: 'silver', label: 'Silver', hex: '#c6c7c8' },
+      { key: 'spaceblack', label: 'Space Black', hex: '#565457' },
+    ],
+  },
+  {
+    key: 'ipadair', label: 'iPad Air', modelUrl: '/3d/devices/ipadair.glb', fitHeight: 1.7,
+    screenAspect: 1.34, screenCornerFrac: 0.007, screenTextureTranspose: 'main', slot: 'tablet', screenPx: [2732, 2048],
+    finishes: [{ key: 'blue', label: 'Blue', hex: '#8f9fb5' }],
+  },
+  {
+    key: 'displayxdr', label: 'Pro Display XDR', modelUrl: '/3d/devices/displayxdr.glb', fitHeight: 1.5,
+    screenAspect: 1.778, screenCornerFrac: 0, slot: 'display', screenPx: [6016, 3384],
+    finishes: [{ key: 'silver', label: 'Silver', hex: '#c6c7c8' }],
+  },
+  {
+    key: 'studiodisplay', label: 'Studio Display', modelUrl: '/3d/devices/studiodisplay.glb', fitHeight: 1.5,
+    screenAspect: 1.78, screenCornerFrac: 0.012, screenTextureFlipY: false, slot: 'display', screenPx: [5120, 2880],
+    finishes: [{ key: 'silver', label: 'Silver', hex: '#d8d8da' }],
+  },
+];
+
+export function findDevice(modelUrl: string | null | undefined): DeviceDef | undefined {
+  return DEVICES.find((d) => d.modelUrl === modelUrl);
+}
+
+// Single source of truth for "load this device" — used by both the device
+// picker (every click) and the Mockup tab's first-entry default, so the two
+// paths can never drift (e.g. one resetting the model offset, the other not).
+export function selectDevice(key: string): void {
+  const dev = DEVICES.find((d) => d.key === key);
+  if (!dev) return;
+  const s = use3DStore.getState();
+  s.setModelUrl(dev.modelUrl, dev.label);
+  s.setModelScale(1);
+  s.centerModel(0, 0);                          // device meshes are already bbox-centred
+  s.setParam('mockup', 'useModelColor', 'On');   // show its real materials first
+}

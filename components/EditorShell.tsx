@@ -1,0 +1,201 @@
+'use client';
+
+import { useEffect, useRef, useState } from 'react';
+import dynamic from 'next/dynamic';
+import { usePathname } from 'next/navigation';
+import AppTour from '@/components/AppTour';
+import { StrataLoader } from '@/components/StrataLoader';
+import WelcomeDialog from '@/components/WelcomeDialog';
+import { modeForSection, sectionFromPathname } from '@/lib/navSections';
+import { capturePoster } from '@/lib/projectPoster';
+import { flushScene, startSceneAutosave } from '@/lib/scenePersist';
+import { flushThreeD, startThreeDAutosave } from '@/lib/three3dPersist';
+import { preloadMockupProject } from '@/lib/mockupPreload';
+import { useHistoryStore } from '@/store/useHistoryStore';
+import { useProjectStore } from '@/store/useProjectStore';
+import { useUIStore } from '@/store/useUIStore';
+
+const MobileEditor = dynamic(() => import('@/components/MobileEditor'), {
+  ssr: false,
+  loading: () => <EditorLoading />,
+});
+
+const DesktopEditor = dynamic(() => import('@/components/DesktopEditor'), {
+  ssr: false,
+  loading: () => <EditorLoading />,
+});
+
+// The desktop shell is a five-column grid whose four fixed columns need
+// 64 + 296 + 280 + 280 = 920px before the stage — minmax(0, 1fr) — gets ANY
+// width. Below that the preview collapses to zero and the editor looks broken:
+// measured on the deploy at 769px, the stage column was 0px and the canvas 0x525.
+// So the phone layout has to own everything up to the width where the desktop
+// grid actually fits. Keep this in step with the same breakpoint in
+// app/globals.css and components/ExportDialog.tsx.
+const MOBILE_QUERY = '(max-width: 919px)';
+
+// Belt-and-braces save interval, asked for explicitly. The autosaves are the
+// real save path; this is the floor under them.
+const SAVE_HEARTBEAT_MS = 5 * 60_000;
+type ViewportMode = 'pending' | 'mobile' | 'desktop';
+
+function useViewportMode(): ViewportMode {
+  const [mode, setMode] = useState<ViewportMode>('pending');
+
+  useEffect(() => {
+    const query = window.matchMedia(MOBILE_QUERY);
+    const sync = () => setMode(query.matches ? 'mobile' : 'desktop');
+    sync();
+    query.addEventListener('change', sync);
+    return () => query.removeEventListener('change', sync);
+  }, []);
+
+  return mode;
+}
+
+function EditorLoading() {
+  return (
+    <main className="editor-loading" aria-label="Loading editor" aria-busy="true">
+      <StrataLoader />
+    </main>
+  );
+}
+
+/**
+ * Mounted by app/(editor)/layout.tsx, so it survives every section navigation:
+ * the Pixi and Three canvases, the autosave loop and the whole store graph stay
+ * alive while the URL changes from /library to /mockup. The section pages under
+ * that layout render nothing — they only declare the route and its <title>.
+ *
+ * The URL is the source of truth for which section is open; useUIStore.nav is
+ * the read path the panels already use, mirrored from it here.
+ */
+export default function EditorShell({ children }: { children?: React.ReactNode }) {
+  const mode = useViewportMode();
+  const pathname = usePathname();
+  const section = sectionFromPathname(pathname);
+  const seeded = useRef(false);
+  const projects = useProjectStore((s) => s.projects);
+  const activeProjectId = useProjectStore((s) => s.activeId);
+  const projectsBooted = useProjectStore((s) => s.booted);
+  const openProject = useProjectStore((s) => s.open);
+  const createProject = useProjectStore((s) => s.create);
+
+  // Seed the store during the first render rather than in the effect below:
+  // an effect lands after the editor's first paint, so a deep link to /mockup
+  // would flash the library first. Safe to write mid-render only because no
+  // subscriber is mounted yet — DesktopEditor is rendered by this component.
+  if (!seeded.current) {
+    seeded.current = true;
+    // Through the action, not setState: setNav also records the last EDITING
+    // section, which the Projects tab hands back to when a project is opened.
+    if (useUIStore.getState().nav !== section) useUIStore.getState().setNav(section);
+  }
+
+  // Later changes — rail clicks, back/forward, a pasted URL. Rail clicks also
+  // set the store optimistically, so this mostly matters for history moves.
+  useEffect(() => {
+    // Through the action, not setState: setNav also records the last EDITING
+    // section, which the Projects tab hands back to when a project is opened.
+    if (useUIStore.getState().nav !== section) useUIStore.getState().setNav(section);
+  }, [section]);
+
+  useEffect(() => {
+    useUIStore.getState().hydratePreferences();
+    useProjectStore.getState().bootstrap(modeForSection(section));
+    const stopHistory = useHistoryStore.getState().start();
+    const stopAutosave = startSceneAutosave();
+    // The Mockup/3D studio autosaves too. It used to be explicit-only, which
+    // read as "the mockup doesn't save": leaving the section never wrote, so an
+    // arrangement survived only if the button in the Mockup panel was found and
+    // clicked. That button is gone; "Save now" lives in the project dock, next
+    // to the state of these two autosaves.
+    const stopThreeDAutosave = startThreeDAutosave();
+
+    // Five-minute heartbeat on top of the two autosaves. They already write
+    // within half a second of an edit, so this is a backstop, not the save
+    // path: it catches anything a dirty-check skipped, and it is the moment the
+    // project's card picture is refreshed for a long editing session that never
+    // touches the rail. Both flushes are no-ops when nothing changed, so an idle
+    // tab costs two signature comparisons every five minutes and no writes.
+    const heartbeat = setInterval(() => {
+      const wroteScene = flushScene();
+      const wroteStudio = flushThreeD();
+      if (wroteScene || wroteStudio) capturePoster(useProjectStore.getState().activeId);
+    }, SAVE_HEARTBEAT_MS);
+
+    return () => {
+      stopHistory();
+      stopAutosave();
+      stopThreeDAutosave();
+      clearInterval(heartbeat);
+    };
+  }, []);
+
+  // Library and Mockup are two document modes in one project list. Entering a
+  // mode selects its most recent project; if none exists yet, it creates one.
+  // This keeps the inactive store target null, so one project can never save
+  // both documents just because the user clicked another rail tab.
+  useEffect(() => {
+    if (!projectsBooted || (section !== 'library' && section !== 'mockup')) return;
+    const wanted = modeForSection(section);
+    const active = projects.find((project) => project.id === activeProjectId);
+    if (active?.mode === wanted) return;
+    const existing = projects.find((project) => project.mode === wanted);
+    if (existing) openProject(existing.id);
+    else createProject(`Project ${projects.length + 1}`, wanted);
+  }, [activeProjectId, createProject, openProject, projects, projectsBooted, section]);
+
+  // Mockup GLBs can be much larger than the rest of the editor (the XDR is
+  // ~13 MB). Parse the most recent Mockup project's device during an idle turn
+  // in the other sections, so Library → Mockup only has to clone/setup it.
+  useEffect(() => {
+    if (!projectsBooted || section === 'mockup') return;
+    const mockup = projects.find((project) => project.mode === 'mockup');
+    const run = () => { void preloadMockupProject(mockup?.id); };
+    const idleWindow = window as Window & {
+      requestIdleCallback?: (callback: IdleRequestCallback, options?: IdleRequestOptions) => number;
+      cancelIdleCallback?: (handle: number) => void;
+    };
+    if (idleWindow.requestIdleCallback) {
+      const handle = idleWindow.requestIdleCallback(run, { timeout: 500 });
+      return () => idleWindow.cancelIdleCallback?.(handle);
+    }
+    const handle = globalThis.setTimeout(run, 150);
+    return () => globalThis.clearTimeout(handle);
+  }, [projects, projectsBooted, section]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || e.altKey) return;
+      const key = e.key.toLowerCase();
+      if (key !== 'z' && key !== 'y') return;
+      const target = e.target as HTMLElement | null;
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT' || target.isContentEditable)) return;
+      e.preventDefault();
+      const history = useHistoryStore.getState();
+      if (key === 'y' || e.shiftKey) history.redo();
+      else history.undo();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
+  if (mode === 'pending') {
+    return (
+      <>
+        <EditorLoading />
+        {children}
+      </>
+    );
+  }
+
+  return (
+    <>
+      {mode === 'mobile' ? <MobileEditor /> : <DesktopEditor />}
+      <WelcomeDialog />
+      {mode === 'desktop' && <AppTour />}
+      {children}
+    </>
+  );
+}

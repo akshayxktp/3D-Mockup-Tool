@@ -1,0 +1,708 @@
+'use client';
+
+import { useEffect, useRef, useState } from 'react';
+import { useSceneStore } from '@/store/useSceneStore';
+import { getRendererInstance } from '@/lib/rendererInstance';
+import { BASE_PATH, IS_STATIC_EXPORT } from '@/lib/paths';
+import { supportsWebCodecs, encodeMp4WebCodecs } from '@/lib/webcodecsExport';
+import { encodeGifInBrowser, gifEffectiveFps } from '@/lib/gifExport';
+import { encodeWebmWebCodecs } from '@/lib/webmExport';
+import { countDemoSlotsInUse } from '@/lib/demoUsage';
+import { gradeFilter } from '@/lib/canvasGrade';
+import { use3DStore } from '@/store/use3DStore';
+import { threeDefaults } from '@/three3d';
+import { BackIcon, ExportIcon, PauseIcon, PlayIcon } from '@/components/EditorIcons';
+
+// An export artifact: server files carry a /exports url; WebCodecs results are
+// local Blobs (url is an object URL for the download link).
+interface OutputFile { name: string; url: string; blob?: Blob }
+
+// WebM replaced the old 'both': it encodes entirely in this tab through
+// WebCodecs, whereas 'both' only ever meant "run the pipeline twice".
+type Fmt = 'mp4' | 'gif' | 'webm' | 'png';
+type Res = '720p' | '1080p' | '2k' | '4k' | 'exact';
+// PNG resolutions are named by the long edge, in multiples of 1024 — the
+// same "K" convention DCI uses for 2K/4K digital cinema (2048/4096), just
+// carried further so a mockup can go up to 8K.
+type ImgRes = '1k' | '2k' | '3k' | '4k' | '5k' | '6k' | '7k' | '8k';
+type Phase = 'idle' | 'preparing' | 'capturing' | 'encoding' | 'done' | 'error';
+
+// Presets are defined by the shortest edge (vertical 1080p = 1080×1920).
+// Key order drives the pill order in the dialog — smallest first.
+const RES_SHORT: Record<Exclude<Res, 'exact'>, number> = { '720p': 720, '1080p': 1080, '2k': 1440, '4k': 2160 };
+const RES_LABEL: Record<Exclude<Res, 'exact'>, string> = { '720p': '720p', '1080p': '1080p', '2k': '2K', '4k': '4K' };
+
+const IMG_RES_LONG: Record<ImgRes, number> = {
+  '1k': 1024, '2k': 2048, '3k': 3072, '4k': 4096, '5k': 5120, '6k': 6144, '7k': 7168, '8k': 8192,
+};
+const IMG_RES_LABEL: Record<ImgRes, string> = {
+  '1k': '1K', '2k': '2K', '3k': '3K', '4k': '4K', '5k': '5K', '6k': '6K', '7k': '7K', '8k': '8K',
+};
+
+// Target output size + capture scale for a given preset. Even dimensions
+// are required by libx264 with yuv420p.
+function targetFor(res: Res, s: { width: number; height: number; customW: number; customH: number; aspect: string }) {
+  if (res === 'exact' && s.aspect !== 'custom') res = '1080p'; // stale selection after aspect change
+  let k: number;
+  let tw: number, th: number;
+  if (res === 'exact') {
+    k = Math.max(s.customW, s.customH) / Math.max(s.width, s.height);
+    tw = s.customW; th = s.customH;
+  } else {
+    k = RES_SHORT[res] / Math.min(s.width, s.height);
+    tw = Math.round(s.width * k); th = Math.round(s.height * k);
+  }
+  return { k, width: tw - (tw % 2), height: th - (th % 2) };
+}
+
+// PNG has no codec parity constraint, so the long edge lands exactly on the
+// requested "K" value instead of being rounded to an even number.
+function targetForImage(res: ImgRes, s: { width: number; height: number }) {
+  const k = IMG_RES_LONG[res] / Math.max(s.width, s.height);
+  return { k, width: Math.round(s.width * k), height: Math.round(s.height * k) };
+}
+
+// Brightness / Contrast / Saturation are a CSS filter on the live <canvas>, so
+// the backing store a capture reads is ungraded. Replay the same filter through
+// Canvas2D — which accepts the identical syntax — onto a copy, so the exported
+// image matches what the stage shows. Returns the source untouched when the
+// Adjustments are all at their defaults.
+function gradeCanvas(source: HTMLCanvasElement): HTMLCanvasElement {
+  const { effectId, params } = use3DStore.getState();
+  const dflts = threeDefaults(effectId);
+  const filter = gradeFilter({ ...dflts, ...(params[effectId] ?? {}) }, (k) => k in dflts);
+  if (!filter) return source;
+  const out = document.createElement('canvas');
+  out.width = source.width;
+  out.height = source.height;
+  const ctx = out.getContext('2d');
+  if (!ctx) return source;
+  ctx.filter = filter;
+  ctx.drawImage(source, 0, 0);
+  return out;
+}
+
+function formatTime(seconds: number) {
+  const safe = Math.max(0, seconds);
+  const minutes = Math.floor(safe / 60);
+  const rest = safe - minutes * 60;
+  return `${minutes}:${rest.toFixed(1).padStart(4, '0')}`;
+}
+
+async function post(body: any) {
+  const res = await fetch(`${BASE_PATH}/api/export`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export default function ExportDialog({ onClose }: { onClose: () => void }) {
+  const store = useSceneStore;
+  const aspect = useSceneStore((s) => s.aspect);
+  const width = useSceneStore((s) => s.width);
+  const height = useSceneStore((s) => s.height);
+  const customW = useSceneStore((s) => s.customW);
+  const customH = useSceneStore((s) => s.customH);
+  const frame = useSceneStore((s) => s.frame);
+  const fps = useSceneStore((s) => s.fps);
+  const duration = useSceneStore((s) => s.duration);
+  const audioUrl = useSceneStore((s) => s.audioUrl);
+  const backgroundAlpha = useSceneStore((s) => s.background.alpha ?? 100);
+  const playing = useSceneStore((s) => s.playing);
+  const setPlaying = useSceneStore((s) => s.setPlaying);
+  const demoSlots = useSceneStore(countDemoSlotsInUse);
+  const previewCanvasRef = useRef<HTMLCanvasElement>(null);
+  const [format, setFormat] = useState<Fmt>('mp4');
+  const [res, setRes] = useState<Res>('1080p');
+  const [imgRes, setImgRes] = useState<ImgRes>('2k');
+  const [transparent, setTransparent] = useState(false);
+  const [phase, setPhase] = useState<Phase>('idle');
+  const [captured, setCaptured] = useState(0);
+  const [total, setTotal] = useState(0);
+  const [outputs, setOutputs] = useState<OutputFile[]>([]);
+  const [engine, setEngine] = useState<'browser' | 'ffmpeg'>('ffmpeg');
+  const [err, setErr] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [savedTo, setSavedTo] = useState<string | null>(null);
+  const [saveErr, setSaveErr] = useState('');
+  // Distinct from saveErr: not a failure, a nudge. See saveToFolder.
+  const [saveHint, setSaveHint] = useState('');
+  // Set once a folder attempt has come back with nothing. The retry then omits
+  // the picker's `id`, which is the only way to stop a remembered directory
+  // overriding startIn — see saveToFolder.
+  const [pickerIgnoresMemory, setPickerIgnoresMemory] = useState(false);
+  const [confirmDemo, setConfirmDemo] = useState(false);
+  // Probed after mount: WebCodecs is absent during SSR, and branching the first
+  // render on it would desync hydration.
+  const [hasWebCodecs, setHasWebCodecs] = useState(false);
+  useEffect(() => { setHasWebCodecs(supportsWebCodecs()); }, []);
+
+  // Both formats encode client-side now — H.264 through WebCodecs, GIF through
+  // gifenc — so a build with no API routes can still export. What genuinely
+  // still needs the server is muxing an audio track, and making MP4 on a
+  // browser that has no WebCodecs at all.
+  // PNG never needs the server — it's one frame drawn straight off the live
+  // canvas, no encoder or audio mux involved.
+  const needsServer = format !== 'gif' && format !== 'png' && (!hasWebCodecs || !!audioUrl);
+  const serverUnavailable = IS_STATIC_EXPORT && needsServer;
+
+  // The mobile export page mirrors the existing renderer instead of creating
+  // a second Pixi/Three instance. Desktop hides this canvas completely.
+  useEffect(() => {
+    // same bound as MOBILE_QUERY in app/page.tsx — see the note there
+    if (!window.matchMedia('(max-width: 919px)').matches) return;
+    let raf = 0;
+    const draw = () => {
+      const target = previewCanvasRef.current;
+      const source = getRendererInstance()?.extractCanvas();
+      if (target && source && source.width > 0 && source.height > 0) {
+        const scale = Math.min(1, 1200 / Math.max(source.width, source.height));
+        const nextWidth = Math.max(1, Math.round(source.width * scale));
+        const nextHeight = Math.max(1, Math.round(source.height * scale));
+        if (target.width !== nextWidth || target.height !== nextHeight) {
+          target.width = nextWidth;
+          target.height = nextHeight;
+        }
+        target.getContext('2d')?.drawImage(source, 0, 0, nextWidth, nextHeight);
+      }
+      raf = requestAnimationFrame(draw);
+    };
+    raf = requestAnimationFrame(draw);
+    return () => cancelAnimationFrame(raf);
+  }, []);
+
+  // File System Access API — Chromium (Edge/Chrome) only. Lets the user pick a
+  // destination folder; falls back to the download links when unavailable.
+  const canPickDir = typeof window !== 'undefined' && 'showDirectoryPicker' in window;
+
+  const fileBytes = async (file: OutputFile): Promise<Blob> => {
+    if (file.blob) return file.blob; // WebCodecs result — already local
+    const resp = await fetch(file.url);
+    if (!resp.ok) throw new Error(`could not read ${file.name}`);
+    return resp.blob();
+  };
+
+  // Ask once per file instead of once for a folder. This path never touches a
+  // directory handle, so the blocklist below cannot reach it — which is why it
+  // is offered as its own button rather than only as a fallback.
+  const saveEachFile = async () => {
+    for (const file of outputs) {
+      const handle = await window.showSaveFilePicker({ suggestedName: file.name });
+      const writable = await handle.createWritable();
+      await writable.write(await fileBytes(file));
+      await writable.close();
+    }
+    setSavedTo(outputs.map((o) => o.name).join(', '));
+  };
+
+  // Copy the freshly-encoded files into a folder the user picks. Folder-level
+  // write permission is often denied (the browser's "save changes" prompt, or
+  // Windows/OneDrive controlled-folder protection) — when that happens, fall
+  // back to a per-file "Save as" dialog, which needs no folder permission.
+  const saveToFolder = async () => {
+    setSaveErr('');
+    setSaveHint('');
+    setSaving(true);
+    try {
+      try {
+        // The browser keeps a blocklist of directories this API refuses — drive
+        // roots, Windows and Program Files, the macOS Library, and the user's
+        // HOME ROOT. Picking one shows the browser's own "contains system files"
+        // dialog, and backing out of it rejects with AbortError: the SAME error
+        // a plain cancel gives, so the two cannot be told apart afterwards.
+        //
+        // `startIn` alone does not prevent it. Per the spec, when `startIn` is a
+        // well-known directory it is only a FALLBACK: "If there is an existing
+        // mapping from the given ID to a path, this mapping is used. Otherwise,
+        // the path suggested via the WellKnownDirectory is used." So `id` wins,
+        // and a browser that remembers somewhere unusable keeps reopening there
+        // no matter what startIn says. Adding startIn while keeping id — which
+        // is what the first fix did — helps only a first-time user.
+        //
+        // Dropping `id` removes the mapping from the equation and lets startIn
+        // decide. That also forgets the last folder, which is worth keeping, so
+        // it is not dropped up front: the first attempt remembers, and an
+        // attempt that came back empty-handed retries without it.
+        const dir = await window.showDirectoryPicker({
+          ...(pickerIgnoresMemory ? {} : { id: 'motion-exports' }),
+          mode: 'readwrite',
+          startIn: 'downloads',
+        });
+        for (const file of outputs) {
+          const handle = await dir.getFileHandle(file.name, { create: true });
+          const writable = await handle.createWritable();
+          await writable.write(await fileBytes(file));
+          await writable.close();
+        }
+        setSavedTo(dir.name);
+        return;
+      } catch (e: any) {
+        if (e?.name === 'AbortError') {
+          // Cancelling and being refused arrive here as the same error, so this
+          // has to cover both without accusing the user of either, and it has to
+          // name the button that always works rather than describe a rule.
+          setPickerIgnoresMemory(true);
+          // The label below changes with the file count, so point at the button
+          // by position rather than by a name that might not match it.
+          setSaveHint(pickerIgnoresMemory
+            ? 'Still nothing saved. Use the button below instead — it asks per file, never asks for a folder, and is not subject to the directories the browser holds back.'
+            : 'Nothing was saved. Some folders are off limits to the browser — drive roots, Windows, Program Files and your user folder itself. Trying the folder again will now start from Downloads; the button below always works.');
+          return;
+        }
+        if (e?.name !== 'NotAllowedError' && e?.name !== 'SecurityError') throw e;
+        // fall through — write access to the folder was denied
+      }
+      await saveEachFile();
+    } catch (e: any) {
+      if (e?.name !== 'AbortError') setSaveErr(String(e?.message ?? e)); // ignore user cancel
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // The same per-file path, reachable directly rather than only after a folder
+  // save has already failed.
+  const saveFilesOnly = async () => {
+    setSaveErr('');
+    setSaveHint('');
+    setSaving(true);
+    try {
+      await saveEachFile();
+    } catch (e: any) {
+      if (e?.name !== 'AbortError') setSaveErr(String(e?.message ?? e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const run = async () => {
+    setConfirmDemo(false);
+    const s = store.getState();
+    const renderer = getRendererInstance();
+    if (!renderer) { setErr('Renderer not ready'); setPhase('error'); return; }
+
+    if (format === 'png') {
+      const target = targetForImage(imgRes, s);
+      const wasPlaying = s.playing;
+      s.setPlaying(false);
+      setTotal(1);
+      setCaptured(0);
+      setPhase('capturing');
+      setErr('');
+      try {
+        await renderer.beginVideoExport?.();
+        renderer.setCaptureScale(target.k); // hi-res backing store; layout untouched
+        if (transparent) renderer.setTransparentBackground?.(true);
+        try {
+          await renderer.seekVideos?.(s.frame); // frame-accurate video cards
+          renderer.renderFrame(s.frame);
+          const canvas = gradeCanvas(renderer.extractCanvas());
+          const blob = await new Promise<Blob>((resolve, reject) => {
+            canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('Could not encode PNG'))), 'image/png');
+          });
+          const stamp = Date.now().toString(36);
+          setOutputs([{ name: `motion_${stamp}.png`, url: URL.createObjectURL(blob), blob }]);
+          setEngine('browser');
+          setCaptured(1);
+          setPhase('done');
+        } finally {
+          renderer.endVideoExport?.();
+          renderer.setCaptureScale(1);
+          renderer.setTransparentBackground?.(false);
+          renderer.resumeVideos?.();
+          if (!wasPlaying) renderer.pauseVideos?.();
+        }
+      } catch (e: any) {
+        setErr(String(e?.message ?? e));
+        setPhase('error');
+      } finally {
+        if (wasPlaying) s.setPlaying(true);
+      }
+      return;
+    }
+
+    const totalFrames = Math.max(1, Math.round(s.duration * s.fps));
+    const target = targetFor(res, s);
+    const wasPlaying = s.playing;
+    s.setPlaying(false);
+    setTotal(totalFrames);
+    setPhase('capturing');
+    setErr('');
+
+    // Fast path — everything encoded in the browser, so a deploy needs no
+    // ffmpeg on the box at all. MP4 goes through hardware H.264 (WebCodecs);
+    // GIF is quantised by gifenc, since WebCodecs has no GIF encoder to offer —
+    // VideoEncoder only speaks video codecs. Audio muxing is the one job left
+    // that still requires the server pipeline, and it does not apply to GIF.
+    const wantsMp4 = format === 'mp4';
+    const wantsGif = format === 'gif';
+    const wantsWebm = format === 'webm';
+    // GIF is pure JS and always works here. The two video formats need
+    // WebCodecs, and an audio track is the one job only the server can do.
+    const canEncodeInBrowser = wantsGif || (supportsWebCodecs() && !s.audioUrl);
+
+    // One capture pass: prepare the video cards, hold the hi-res backing store
+    // for the duration, and put everything back however it exits.
+    const capturePass = async <T,>(encode: () => Promise<T>): Promise<T> => {
+      setCaptured(0);
+      setPhase('preparing');
+      await renderer.beginVideoExport?.(); // one forward decode pass for video cards
+      setPhase('capturing');
+      renderer.setCaptureScale(target.k);  // hi-res backing store; layout untouched
+      // WebM is the only video format here with an alpha channel to fill.
+      if (transparent && wantsWebm) renderer.setTransparentBackground?.(true);
+      try {
+        return await encode();
+      } finally {
+        renderer.endVideoExport?.();
+        renderer.setCaptureScale(1);
+        renderer.setTransparentBackground?.(false);
+        renderer.resumeVideos?.();
+        if (!wasPlaying) renderer.pauseVideos?.();
+      }
+    };
+
+    const drawFrame = async (f: number) => {
+      await renderer.seekVideos?.(f); // frame-accurate video cards
+      renderer.renderFrame(f);
+      return renderer.extractCanvas();
+    };
+
+    if (canEncodeInBrowser) {
+      try {
+        const stamp = Date.now().toString(36);
+        const files: OutputFile[] = [];
+        if (wantsWebm) {
+          const blob = await capturePass(() => encodeWebmWebCodecs({
+            width: target.width,
+            height: target.height,
+            fps: s.fps,
+            totalFrames,
+            renderFrame: drawFrame,
+            onProgress: setCaptured,
+          }));
+          files.push({ name: `motion_${stamp}.webm`, url: URL.createObjectURL(blob), blob });
+        }
+        if (wantsMp4) {
+          const blob = await capturePass(() => encodeMp4WebCodecs({
+            width: target.width,
+            height: target.height,
+            fps: s.fps,
+            totalFrames,
+            renderFrame: drawFrame,
+            onProgress: setCaptured,
+          }));
+          files.push({ name: `motion_${stamp}.mp4`, url: URL.createObjectURL(blob), blob });
+        }
+        if (wantsGif) {
+          const blob = await capturePass(() => encodeGifInBrowser({
+            width: target.width,
+            height: target.height,
+            fps: s.fps,
+            totalFrames,
+            renderFrame: drawFrame,
+            onProgress: setCaptured,
+          }));
+          files.push({ name: `motion_${stamp}.gif`, url: URL.createObjectURL(blob), blob });
+        }
+        setEngine('browser');
+        setOutputs(files);
+        setPhase('done');
+        if (wasPlaying) s.setPlaying(true);
+        return;
+      } catch {
+        // encoder unavailable/failed mid-run — fall through to the ffmpeg path
+        setCaptured(0);
+        setPhase('capturing');
+      }
+    }
+
+    // WebM exists only on the WebCodecs path — the server pipeline has no VP9
+    // branch, and adding one would put it back on an ffmpeg this deploy lacks.
+    if (wantsWebm) {
+      setErr('WebM needs WebCodecs, which this browser did not provide. Try MP4 or GIF.');
+      setPhase('error');
+      if (wasPlaying) s.setPlaying(true);
+      return;
+    }
+
+    // A static build ships no API routes, so there is no ffmpeg to fall back
+    // to — say that plainly instead of letting the POST fail as a 404.
+    if (IS_STATIC_EXPORT) {
+      setErr('This build has no export server. GIF encodes in-browser here; MP4 needs WebCodecs and no audio track.');
+      setPhase('error');
+      if (wasPlaying) s.setPlaying(true);
+      return;
+    }
+
+    try {
+      setPhase('preparing');
+      await renderer.beginVideoExport?.();
+      setPhase('capturing');
+      const { sessionId } = await post({ action: 'begin' });
+
+      renderer.setCaptureScale(target.k); // hi-res backing store; layout untouched
+      try {
+        for (let f = 0; f < totalFrames; f++) {
+          await renderer.seekVideos?.(f);                 // frame-accurate video cards (no-op without video)
+          const dataUrl = renderer.captureFrame(f);       // time = frame counter, never wall-clock
+          await post({ action: 'frame', sessionId, index: f, dataUrl });
+          setCaptured(f + 1);
+          // yield to keep UI responsive
+          if (f % 5 === 0) await new Promise((r) => setTimeout(r, 0));
+        }
+      } finally {
+        renderer.endVideoExport?.();                      // restore original video sources
+        renderer.setCaptureScale(1);
+        renderer.resumeVideos?.();                        // back to live playback in the preview
+      }
+
+      setPhase('encoding');
+
+      // audio bytes (blob url → base64) if present
+      let audio: string | undefined;
+      if (s.audioUrl) {
+        const buf = await (await fetch(s.audioUrl)).arrayBuffer();
+        audio = btoa(String.fromCharCode(...new Uint8Array(buf)));
+      }
+
+      const { files } = await post({
+        action: 'encode',
+        sessionId,
+        fps: s.fps,
+        format,
+        width: target.width,
+        height: target.height,
+        audio,
+      });
+
+      setEngine('ffmpeg');
+      setOutputs((files as string[]).map((f) => ({ name: f, url: `${BASE_PATH}/exports/${f}` })));
+      setPhase('done');
+      s.setFrame(s.frame);
+      if (wasPlaying) s.setPlaying(true);
+    } catch (e: any) {
+      setErr(String(e?.message ?? e));
+      setPhase('error');
+    }
+  };
+
+  return (
+    <div className="modal-backdrop export-backdrop" onClick={onClose}>
+      <div className="modal export-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <button className="icon-btn export-mobile-back" onClick={onClose} aria-label="Back to editor"><BackIcon /></button>
+          <span>Export</span>
+          <button className="icon-btn" onClick={onClose}>✕</button>
+        </div>
+
+        <div className="export-mobile-preview" aria-label="Export preview">
+          <canvas ref={previewCanvasRef} />
+        </div>
+
+        <div className="export-mobile-transport">
+          <button
+            className="export-mobile-play"
+            onClick={() => setPlaying(!playing)}
+            aria-label={playing ? 'Pause preview' : 'Play preview'}
+          >
+            {playing ? <PauseIcon /> : <PlayIcon />}
+          </button>
+          <span><b>{formatTime(frame / Math.max(1, fps))}</b> / {formatTime(duration)}</span>
+        </div>
+
+        <div className="modal-body export-modal-body">
+          <>
+            <div className="ctl-row">
+              <label className="ctl-label">
+                <span className="export-label-desktop">Format</span>
+                <span className="export-label-mobile">Output</span>
+              </label>
+              <div className="ctl-input">
+                <div className="pills pills-fit">
+                  {(['mp4', 'gif', 'webm', 'png'] as Fmt[]).map((f) => (
+                    <button key={f} className={`pill ${format === f ? 'active' : ''}`} onClick={() => setFormat(f)}>{f.toUpperCase()}</button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <div className="ctl-row">
+              <label className="ctl-label">Resolution</label>
+              <div className="ctl-input">
+                <div className="pills pills-fit">
+                  {format === 'png' ? (
+                    (Object.keys(IMG_RES_LONG) as ImgRes[]).map((r) => (
+                      <button key={r} className={`pill ${imgRes === r ? 'active' : ''}`} onClick={() => setImgRes(r)}>{IMG_RES_LABEL[r]}</button>
+                    ))
+                  ) : (
+                    <>
+                      {(Object.keys(RES_SHORT) as Exclude<Res, 'exact'>[]).map((r) => (
+                        <button key={r} className={`pill ${res === r ? 'active' : ''}`} onClick={() => setRes(r)}>{RES_LABEL[r]}</button>
+                      ))}
+                      {aspect === 'custom' && (
+                        <button className={`pill ${res === 'exact' ? 'active' : ''}`} onClick={() => setRes('exact')} title={`Exact canvas size ${customW}×${customH}`}>
+                          {customW}×{customH}
+                        </button>
+                      )}
+                    </>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* Only the formats that carry an alpha channel can offer this —
+              MP4 and GIF would flatten the cut-out to black. */}
+            {(format === 'png' || format === 'webm') && (
+              <div className="ctl-row">
+                <label className="ctl-label">Background</label>
+                <div className="ctl-input">
+                  <div className="pills pills-fit">
+                    <button className={`pill ${!transparent ? 'active' : ''}`} onClick={() => setTransparent(false)}>Backdrop</button>
+                    <button className={`pill ${transparent ? 'active' : ''}`} onClick={() => setTransparent(true)}>Transparent</button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            <div className="ctl-hint">
+              {(() => {
+                const t = format === 'png'
+                  ? targetForImage(imgRes, { width, height })
+                  : targetFor(res, { width, height, customW, customH, aspect });
+                return `Output ${t.width}×${t.height} px`;
+              })()}
+            </div>
+
+            {backgroundAlpha < 100 && (
+              <div className="ctl-hint" role="status">
+                {format === 'webm' || format === 'png'
+                  ? `Background alpha is preserved in the ${format === 'png' ? 'PNG' : 'WebM'} export.`
+                  : 'Background alpha is previewed here, but transparent video export requires WebM.'}
+              </div>
+            )}
+
+            {/* GIF keeps frame delay in hundredths of a second, so most fps values
+              cannot be expressed exactly. State the playback rate the file will
+              really carry — this is a property of the format, not of gifenc. */}
+            {format === 'gif' && Math.abs(gifEffectiveFps(fps) - fps) > 0.05 && (
+              <div className="ctl-hint">
+                GIF stores delays in 1/100 s, so {fps} fps plays back at {gifEffectiveFps(fps).toFixed(1)} fps.
+              </div>
+            )}
+
+            {/* Only the combinations that still need native ffmpeg are blocked
+              here — GIF and plain MP4 encode in this tab. The format pills stay
+              reachable so switching to a workable one is one click away. */}
+            {serverUnavailable && (
+              <div className="export-static-note" role="alert">
+                <p>
+                  {audioUrl
+                    ? 'Muxing an audio track still needs native ffmpeg, which this hosted build has no server to run.'
+                    : 'MP4 needs WebCodecs, which this browser doesn’t provide, and this hosted build has no server to run ffmpeg on.'}
+                  {' '}GIF exports here without either — switch the format above, or run it locally:
+                </p>
+                <pre><code>{`git clone https://github.com/appariciojunior/motion-studio-open.git
+cd motion-studio-open
+npm install && brew install ffmpeg
+npm run dev`}</code></pre>
+                <a className="btn full" href="https://github.com/appariciojunior/motion-studio-open" target="_blank" rel="noreferrer">
+                  View on GitHub
+                </a>
+              </div>
+            )}
+
+            {phase === 'idle' && !confirmDemo && !serverUnavailable && (
+              <button className="btn primary full export-primary-action" onClick={() => demoSlots > 0 ? setConfirmDemo(true) : run()}>
+                <ExportIcon size={16} />
+                <span className="export-action-desktop">Start export</span>
+                <span className="export-action-mobile">Export</span>
+              </button>
+            )}
+
+            {phase === 'idle' && confirmDemo && (
+              <div className="export-demo-warning" role="alert">
+                <strong>{demoSlots} demo {demoSlots === 1 ? 'slot is' : 'slots are'} still in use</strong>
+                <p>Demo images will appear in the exported file unless you replace them in Media.</p>
+                <div className="export-demo-actions">
+                  <button className="btn" onClick={() => setConfirmDemo(false)}>Cancel</button>
+                  <button className="btn primary" onClick={run}>Export anyway</button>
+                </div>
+              </div>
+            )}
+
+            {phase === 'preparing' && <div className="progress"><span>{format === 'png' ? 'Preparing…' : 'Preparing videos…'}</span></div>}
+
+            {phase === 'capturing' && (
+              <div className="progress">
+                <div className="progress-bar"><div style={{ width: `${(captured / total) * 100}%` }} /></div>
+                <span>{format === 'png' ? 'Rendering image…' : `Capturing frames ${captured}/${total}`}</span>
+              </div>
+            )}
+
+            {phase === 'encoding' && <div className="progress"><span>Encoding with ffmpeg…</span></div>}
+
+            {phase === 'done' && (
+              <div className="export-done">
+                <p>
+                  Done{engine === 'browser'
+                    ? ` — encoded in-browser (${format === 'gif' ? 'gifenc'
+                      : format === 'webm' ? 'WebCodecs VP9'
+                        : format === 'png' ? 'canvas PNG'
+                          : 'WebCodecs H.264'}).`
+                    : <>. Generated in <code>/exports</code>:</>}
+                </p>
+                <ul>
+                  {outputs.map((f) => (
+                    <li key={f.name}><a href={f.url} download={f.name}>{f.name}</a></li>
+                  ))}
+                </ul>
+                {canPickDir && (
+                  <>
+                    {/* One file is the normal case — every in-browser export
+                        produces exactly one. For that, picking a FOLDER buys
+                        nothing: it is the same single dialog as saving the file,
+                        and it is the one the browser refuses over its blocked
+                        directories. So the folder route only appears when there
+                        is actually more than one file to place, which is the
+                        only time it saves the user a dialog. */}
+                    {outputs.length > 1 && (
+                      <button className="btn primary full" onClick={saveToFolder} disabled={saving}>
+                        {saving ? 'Saving…' : savedTo ? 'Save to another folder…' : 'Choose folder & save'}
+                      </button>
+                    )}
+                    <button
+                      className={`btn full ${outputs.length > 1 ? '' : 'primary'}`}
+                      onClick={saveFilesOnly}
+                      disabled={saving}
+                    >
+                      {saving ? 'Saving…' : outputs.length > 1 ? 'Save files one by one…' : 'Save file…'}
+                    </button>
+                    {savedTo && <p className="ctl-hint">Saved to <code>{savedTo}</code>.</p>}
+                    {saveHint && <p className="ctl-hint">{saveHint}</p>}
+                    {saveErr && <div className="export-error">Save failed: {saveErr}</div>}
+                  </>
+                )}
+              </div>
+            )}
+
+            {phase === 'error' && (
+              <div className="export-error">
+                Export failed: {err}
+                {/ffmpeg|ENOENT/i.test(err) && (
+                  <div className="export-hint">
+                    ffmpeg isn’t installed. Install it, then retry:<br />
+                    <code>brew install ffmpeg</code>
+                  </div>
+                )}
+              </div>
+            )}
+          </>
+        </div>
+      </div>
+    </div>
+  );
+}

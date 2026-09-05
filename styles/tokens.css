@@ -1,0 +1,188 @@
+/* ============================================================
+   MOTION STUDIO — DESIGN TOKENS
+   Light UI from the Figma reference (file 7NtsGHDBicdNLMt48Y6BOX,
+   node 0:2702): white tool surfaces on a #e5e7eb canvas area,
+   Tailwind-gray palette, Inter, and square inner controls. The workspace
+   shell uses separated panel islands; dark theme lives under [data-theme="dark"].
+   ============================================================ */
+:root {
+  /* ---- Surfaces ---- */
+  --stage:      #e5e7eb;   /* canvas area behind the preview */
+  /* Grid on the stage backdrop. Without it the canvas edge vanishes
+     whenever the scene background matches --stage — which the defaults do
+     exactly, in dark mode (#0d0d0d on #0d0d0d). */
+  --stage-dot:  rgba(0,0,0,0.085);
+  /* 1px ring around the canvas, so the frame edge is stated outright rather
+     than inferred from where the dot grid stops. */
+  --stage-edge: rgba(0,0,0,0.16);
+  /* Soft lift under the canvas, so it reads as sitting above the dotted
+     backdrop rather than being cut into it. */
+  --stage-shadow: rgba(0,0,0,0.12);
+  --card:       #ffffff;   /* panels */
+  --card-inset: #f3f4f6;   /* input tracks / wells / segmented bg */
+  --card-thumb: #e5e7eb;   /* hover chips, kbd chip */
+  --card-soft:  #f9fafb;   /* template cards, easing editor bg */
+  --frame:      #e5e7eb;   /* canvas frame / thumb backdrop */
+  --line:       #e5e7eb;   /* hairline dividers, panel borders */
+  --line-soft:  rgba(0,0,0,0.12); /* vertical separators (timeline) */
+  --handle:     #b9bfcb;   /* slider handle bar + fill border */
+
+  /* ---- Text ---- */
+  --fg:        #111827;    /* active / selected */
+  --fg-body:   #111827;    /* primary readouts (time current, slider value) */
+  --fg-label:  #374151;    /* control labels (13px) */
+  --fg-value:  #111827;    /* slider values (12px) */
+  --fg-muted:  #6b7280;    /* eyebrows, secondary text */
+  --fg-faint:  #9ca3af;    /* inactive segments, placeholders, ruler */
+
+  /* ---- Segmented / pills active thumb ---- */
+  --seg-active-bg: #111827;
+  --seg-active-fg: #ffffff;
+
+  /* ---- Inverse (Export button, play button, logo) ---- */
+  --inverse-bg:   #111827;
+  --inverse-fg:   #ffffff;
+  --chip-bg:      #374151; /* playhead chip + line */
+  --chip-fg:      #ffffff;
+
+  /* ---- Beta marker (unfinished feature) — sits on the active dark tab ---- */
+  --beta-bg:      #ffffff;
+  --beta-fg:      #111827;
+
+  /* ---- Motion track lanes (timeline layer stack) ---- */
+  --tl-lane-h:    30px;    /* one lane row */
+  --tl-gutter-w:  86px;    /* visibility + stacking + duplicate + remove */
+  --tl-bar-idle:  #e5e7eb; /* a track bar at rest */
+  --tl-bar-idle-fg: #374151;
+  --tl-bar-on:    #111827; /* the selected track bar */
+  --tl-bar-on-fg: #ffffff;
+
+  /* ---- View gizmo axes (Blender convention: X red, Y green, Z blue).
+         Not theme-varying: the 3D stage background is user-set, not themed. ---- */
+  --gz-x:         #e05252;
+  --gz-y:         #7db72f;
+  --gz-z:         #4a86d9;
+  --gz-neg-fill:  rgba(16, 19, 26, 0.55);  /* hollow balls, readable on any wall */
+  --gz-label:     #0f1319;                 /* letters on the filled balls */
+
+  /* ---- Radii — the design is fully square ---- */
+  --r-card:  0px;
+  --r-ctrl:  0px;
+  --r-seg:   0px;
+  --r-chip:  0px;
+  --r-nav:   0px;
+
+  /* ---- Type scale (Inter) ---- */
+  --fs-label: 13px;  /* control labels, lh 19.5 */
+  --fs-ui:    12px;  /* segments, values, buttons, time, lh 18 */
+  --fs-meta:  11px;  /* asset names, template card labels, lh 16.5 */
+  --fs-eyebrow: 10px;/* section eyebrows, Medium, tracking 1.5px */
+  --fs-micro: 9px;   /* ruler labels */
+  --lh-label: 19.5px;
+  --lh-ui:    18px;
+
+  /* ---- Spacing ---- */
+  --gutter:    0px;   /* flat panels — borders instead of gaps */
+  --pad-card: 14px;   /* templates header padding */
+  --pad-sect: 20px;   /* section h-padding (right panels, timeline) */
+  --gap-row:  12px;   /* between control rows */
+  --gap-tight: 10px;  /* label → control */
+
+  /* ---- Layout ---- */
+  --rail-w:  64px;
+  --tpl-w:  296px;    /* templates panel */
+  --panel-w: 280px;   /* scene / canvas panels */
+  --bottom-h: 56px;   /* timeline bar height */
+
+  /* ---- Control metrics ---- */
+  --ctl-h:   34px;    /* track height */
+  --seg-pad: 3px;     /* segmented inset padding */
+
+  /* ---- Motion ---- */
+  --t-fast: 120ms;
+  /* Sliding segmented highlight. Both values are measured off the reference
+     capture, not guessed: 14.6 frames at 30 fps, and a curve fitted to 29
+     samples across two transitions (rms .037 — every named ease, expo /
+     power3-5 / circ .inOut, sits above .11). The duration is fixed: a
+     two-segment jump took the same 490ms as a one-segment jump. */
+  --t-seg:   490ms;
+  --e-seg:   cubic-bezier(.71, 0, .07, 1);
+  /* The label flip waits for the pill to get there. The curve is flat for its
+     first third, so nothing moves before ~170ms — flipping the text at 190ms
+     lands it under the pill instead of leaving white-on-white mid-travel. */
+  --t-seg-flip: 190ms;
+  /* Slider rubber band: how far the track's pushed edge gives when you drag
+     past an end. The reference stretched 26px on a 943×160 track (2.8% of the
+     width, 16% of the height); on a 34px track that is ~6px either way. */
+  --sl-rubber: 6px;
+  /* The slider fill is the box the value has reached, and in this design it is
+     a QUIET step off the track, not a loud bar. I tried the loud version — the
+     reference's own high-contrast fill, which inverts the readout glyph by
+     glyph — through --inverse-bg and then --chip-bg, and it was wrong in both
+     themes: a dark slab in a light panel, a bright slab in a dark one. The
+     palette had already answered this: --card-inset is the well, --card is
+     what sits in it, --handle draws the hairline between them. That is what
+     the slider always was, and it is what it goes back to.
+
+     So the pair below is the fill and its edge, and the two -on tokens are
+     what the readout and the handle wear where the opaque fill covers them.
+     Light wants them identical to the off-fill colours — the number must read
+     the same the whole way across, and the handle stays --handle throughout,
+     exactly as before. Dark differs on one of them; see that block. */
+  --sl-fill:      var(--card);
+  --sl-fill-edge: var(--handle);
+  --sl-handle-on: var(--handle);
+  --sl-value-on:  var(--fg-value);
+  /* Side of the square step marks the track reveals on hover. */
+  --sl-tick:    3px;
+}
+
+:root[data-theme="dark"] {
+  --stage:      #0d0d0d;
+  --stage-dot:  rgba(255,255,255,0.085);
+  --stage-edge: rgba(255,255,255,0.18);
+  /* Heavier than light mode: a black shadow on a near-black stage (#0d0d0d)
+     has very little room to darken before it stops reading at all. */
+  --stage-shadow: rgba(0,0,0,0.55);
+  --card:       #171717;
+  --card-inset: #232323;
+  --card-thumb: #2d2d2d;
+  --card-soft:  #1f1f1f;
+  --frame:      #0d0d0d;
+  --line:       #303030;
+  --line-soft:  rgba(255,255,255,0.14);
+  --handle:     #595959;
+  --fg:        #ffffff;
+  --fg-body:   #e8e8e8;
+  --fg-label:  #cccccc;
+  --fg-value:  #aaaaaa;
+  --fg-muted:  #a3a3a3;
+  --fg-faint:  #858585;
+  /* Dark uses --card-thumb rather than --card for the fill: --card here is
+     #171717, DARKER than the #232323 track, so the box would read as a hole
+     instead of as something sitting in the well. #2d2d2d is ten steps up —
+     a touch lighter and no more, which is what was asked for — and it is the
+     same pairing .sval:hover and --seg-active-bg already use on these tracks.
+
+     The one place dark differs from light: the handle brightens to --fg-body
+     where the fill has reached it. On a #2d2d2d fill a #595959 bar is nearly
+     lost, and this is the last trace of the reference's inversion that still
+     earns its place. The readout stays --fg-value throughout, so the number
+     reads evenly across the boundary. */
+  --sl-fill:      var(--card-thumb);
+  --sl-fill-edge: var(--handle);
+  --sl-handle-on: var(--fg-body);
+  --sl-value-on:  var(--fg-value);
+  --seg-active-bg: #2d2d2d;
+  --seg-active-fg: #ffffff;
+  --inverse-bg: #ffffff;
+  --inverse-fg: #111111;
+  --chip-bg:    #cccccc;
+  --chip-fg:    #171717;
+  --beta-bg:    #ffffff;
+  --beta-fg:    #111111;
+  --tl-bar-idle:    #2d2d2d;
+  --tl-bar-idle-fg: #cccccc;
+  --tl-bar-on:      #ffffff;
+  --tl-bar-on-fg:   #111111;
+}

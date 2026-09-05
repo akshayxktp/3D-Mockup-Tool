@@ -1,0 +1,43 @@
+#!/bin/sh
+# Refuse to push a branch that would carry this fork's deploy wiring upstream.
+#
+# Install once (this points git at the whole tracked hooks directory, so the
+# hook travels with the repo instead of living only in your .git):
+#
+#   git config core.hooksPath scripts/hooks
+#
+# It only runs when pushing to appariciojunior/motion-studio-open. Vercel wiring
+# remains allowed on the fork's own origin remote.
+#
+# Bypass deliberately when you mean to: git push --no-verify
+
+remote_name="$1"
+remote_url="$2"
+
+case "$remote_name $remote_url" in
+  *appariciojunior/motion-studio-open*) ;;
+  *) exit 0 ;;
+esac
+
+base_ref="${UPSTREAM_BASE:-appariciojunior/main}"
+
+if ! git rev-parse --verify --quiet "$base_ref" >/dev/null 2>&1; then
+  echo ""
+  echo "  Push stopped: comparison base $base_ref was not found."
+  echo "  Run: git fetch appariciojunior main"
+  echo ""
+  exit 1
+fi
+
+UPSTREAM_BASE="$base_ref" node scripts/verify-fork-only.cjs || {
+  status=$?
+  if [ "$status" -eq 2 ]; then
+    exit "$status"
+  fi
+
+  echo ""
+  echo "  Push stopped. Remove the fork-only Vercel changes before syncing."
+  echo "  Use --no-verify only when you deliberately want to override this check."
+  echo ""
+  exit 1
+}

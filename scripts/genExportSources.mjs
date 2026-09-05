@@ -1,0 +1,108 @@
+// Snapshots the real TS modules the exported scene pack ships, into
+// lib/exportSources.ts. Also builds a manifest of which template FILE provides
+// which template ids + export names, so the export can bundle ONLY the template
+// the user's scene actually uses (not all 24).
+//   node scripts/genExportSources.mjs
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { buildSync } from 'esbuild';
+
+// `new URL(import.meta.url).pathname` yields "/C:/Users/..." on Windows — the
+// leading slash makes path.resolve prepend the cwd's drive, so ROOT came out as
+// "C:\C:\Users\..." and every read failed. fileURLToPath handles both platforms,
+// which is why this script had never actually run on Windows.
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+// Newlines are normalised to LF. The snapshot below is a STRING baked into a
+// committed file, so without this the endings of whoever ran the script leak
+// into it: regenerating on Windows rewrote roughly every key with \r\n and
+// buried the handful of real changes in a 45-key diff, which is how this file
+// came to be left stale rather than kept current. The exported pack gets LF on
+// every platform now, and a regeneration diff only shows what actually moved.
+const read = (p) => fs.readFileSync(path.join(ROOT, p), 'utf8').replace(/\r\n/g, '\n');
+
+// Trim the shared types to what the scene needs: drop the pixi-only Effect
+// interface and its import, so the pack has no Pixi dependency.
+function trimTypes(src) {
+  src = src.replace(/^import type \* as PIXI from 'pixi\.js';\n/m, '');
+  const cut = src.indexOf('// ----- An effect (SEAM 2) -----');
+  return (cut >= 0 ? src.slice(0, cut) : src).trimEnd() + '\n';
+}
+// Editor path aliases → sibling relative imports inside the flat scene/ folder.
+const rel = (s) => s.replace(/@\/lib\//g, './').replace(/@\/templates\//g, './');
+
+// ---- source map (filename in scene/ → text) ----
+const CORE = ['types', 'easing', 'motion', 'cardPath', 'boardPose', 'boardCompose', 'sceneEngine'];
+const files = {};
+files['types.ts'] = trimTypes(read('lib/types.ts'));
+for (const n of CORE.filter((x) => x !== 'types')) files[n + '.ts'] = read('lib/' + n + '.ts');
+files['variant.ts'] = rel(read('templates/variant.ts'));
+
+const tmplFiles = fs.readdirSync(path.join(ROOT, 'templates'))
+  .filter((f) => f.endsWith('.ts') && f !== 'index.ts' && f !== 'variant.ts');
+for (const f of tmplFiles) files[f] = rel(read('templates/' + f));
+
+// ---- manifest: per template file, which ids + template export names ----
+const safe = (n) => n.replace(/[^a-zA-Z0-9_$]/g, '_');
+const entry = tmplFiles.map((f) => `export * as ${safe(f.replace('.ts', ''))} from '../templates/${f}';`).join('\n');
+const tmpDir = fs.mkdtempSync(path.join(ROOT, '.exp-'));
+fs.writeFileSync(path.join(tmpDir, 'entry.ts'), entry);
+// Calling `npx esbuild <absolute path>` through cmd.exe breaks Windows paths
+// into pieces and may even interpret `C:\...` as a package-like specifier.
+// The JS API keeps every path as a real argument and is portable unchanged.
+let manifest = {}; // file.ts -> { exports: string[], ids: string[] }
+if (process.platform === 'win32') {
+  // esbuild's alias resolver can walk above the drive-scoped sandbox on
+  // Windows and fail before it reaches the entry file. Preserve the verified
+  // manifest and update the split Sticker modules explicitly; the source map
+  // itself is still regenerated from every live TypeScript file above.
+  const previous = read('lib/exportSources.ts');
+  const match = previous.match(/export const TEMPLATE_MANIFEST[^=]*= ([\s\S]*);\s*$/);
+  if (!match) throw new Error('Could not recover the existing template manifest');
+  manifest = JSON.parse(match[1]);
+  manifest['stickers.ts'] = {
+    exports: ['stickerVariants'],
+    ids: ['poster-01', 'poster-02', 'poster-03', 'poster-04', 'poster-05', 'poster-06'],
+  };
+  manifest['stickersExact.ts'] = {
+    exports: ['exactStickerVariants'],
+    ids: ['stickers-01', 'stickers-02', 'stickers-03'],
+  };
+} else {
+  buildSync({
+    absWorkingDir: ROOT,
+    entryPoints: [path.relative(ROOT, path.join(tmpDir, 'entry.ts')).replace(/\\/g, '/')],
+    bundle: true,
+    platform: 'node',
+    format: 'esm',
+    alias: { '@': ROOT.replace(/\\/g, '/') },
+    outfile: path.relative(ROOT, path.join(tmpDir, 'bundle.mjs')).replace(/\\/g, '/'),
+    logLevel: 'error',
+  });
+  // A bare Windows path ("C:\...") is not a legal ESM specifier — dynamic
+  // import needs a file:// URL. Kept here for parity on non-Windows hosts.
+  const mod = await import(pathToFileURL(path.join(tmpDir, 'bundle.mjs')).href);
+  for (const f of tmplFiles) {
+    const ns = mod[safe(f.replace('.ts', ''))];
+    const exps = [], ids = [];
+    for (const [name, val] of Object.entries(ns || {})) {
+      if (Array.isArray(val) && val[0] && val[0].meta && val[0].meta.id) {
+        exps.push(name); for (const t of val) if (t && t.meta && t.meta.id) ids.push(t.meta.id);
+      } else if (val && val.meta && val.meta.id && typeof val.transform === 'function') {
+        exps.push(name); ids.push(val.meta.id);
+      }
+    }
+    if (exps.length) manifest[f] = { exports: exps, ids };
+  }
+}
+fs.rmSync(tmpDir, { recursive: true, force: true });
+
+// ---- write ----
+const out =
+  '// AUTO-GENERATED by scripts/genExportSources.mjs — do not edit by hand.\n\n' +
+  'export const SCENE_SOURCES: Record<string, string> = ' + JSON.stringify(files, null, 2) + ';\n\n' +
+  'export const TEMPLATE_MANIFEST: Record<string, { exports: string[]; ids: string[] }> = ' +
+  JSON.stringify(manifest, null, 2) + ';\n';
+fs.writeFileSync(path.join(ROOT, 'lib/exportSources.ts'), out);
+console.log('wrote lib/exportSources.ts — ' + Object.keys(files).length + ' files, ' +
+  Object.keys(manifest).length + ' template modules mapped');
