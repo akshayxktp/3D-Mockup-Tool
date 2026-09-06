@@ -4,6 +4,7 @@ import { use3DStore, defaultModelFor } from '@/store/use3DStore';
 import { findDevice } from '@/three3d/devices';
 import FillRow from './FillRow';
 import { fillPatchForGradient, gradientFromFill } from '@/lib/gradient';
+import { SectionHead, useSection } from './PanelSection';
 
 // Friendly display names for the bundled daisy groups (keys stay unchanged).
 const PART_LABELS: Record<string, string> = { Cube: 'Center', Cylinder: 'Stem', Plane: 'Petals' };
@@ -14,7 +15,8 @@ const PART_LABELS: Record<string, string> = { Cube: 'Center', Cylinder: 'Stem', 
 // select/highlight its group here.
 //
 // For bundled devices, shows Finish colour swatches instead of per-part fills.
-export default function ModelColors() {
+export default function ModelColors({ sectionId }: { sectionId?: string } = {}) {
+  const [open, toggle] = useSection(sectionId);
   const modelUrl = use3DStore((s) => (s.models[s.effectId] ?? defaultModelFor(s.effectId)).url);
   const parts = use3DStore((s) => s.parts);
   const partFills = use3DStore((s) => s.partFills);
@@ -33,11 +35,13 @@ export default function ModelColors() {
     const active = (params.finish as string | undefined) ?? device.finishes[0].hex;
     return (
       <>
-        <div className="section-head">
-          <span className="eyebrow">Finish</span>
-          <span className="badge">{device.finishes.find((f) => f.hex === active)?.label ?? 'Custom'}</span>
-        </div>
-        <div className="section-body mc-colors">
+        <SectionHead
+          title="Finish"
+          badge={<span className="badge">{device.finishes.find((f) => f.hex === active)?.label ?? 'Custom'}</span>}
+          open={open}
+          onToggle={toggle}
+        />
+        {open && <div className="section-body mc-colors">
           <div className="finish-swatches">
             {device.finishes.map((f) => (
               <button
@@ -57,18 +61,17 @@ export default function ModelColors() {
               />
             ))}
           </div>
-        </div>
+        </div>}
       </>
     );
   }
 
   return (
     <>
-      <div className="section-head">
-        <span className="eyebrow">Model Colors</span>
+      <SectionHead title="Model Colors" open={open} onToggle={toggle}>
         {selected && <button className="mc-reset-model" onClick={() => selectPart(null)}>clear selection</button>}
-      </div>
-      <div className="section-body mc-colors">
+      </SectionHead>
+      {open && <div className="section-body mc-colors">
         {parts.length === 0 ? (
           <div className="mc-colors-hint">No model loaded yet.</div>
         ) : (
@@ -99,7 +102,7 @@ export default function ModelColors() {
             ))}
           </>
         )}
-      </div>
+      </div>}
     </>
   );
 }

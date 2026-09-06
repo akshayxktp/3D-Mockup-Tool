@@ -15,6 +15,10 @@ export interface UIState {
   mobileTab: 'templates' | 'media' | 'adjust' | 'canvas';
   mobileProjectsOpen: boolean;
   mobilePanelOpen: boolean;
+  // Which collapsible panel sections are open, keyed by section id. Persisted,
+  // because a panel someone folded away should stay folded across a reload —
+  // the whole point of folding it was that they are not using it.
+  sectionsOpen: Record<string, boolean>;
   setNav: (nav: string) => void;
   toggleTheme: () => void;
   toggleLeftPanel: () => void;
@@ -23,12 +27,13 @@ export interface UIState {
   setMobileTab: (tab: UIState['mobileTab']) => void;
   setMobileProjectsOpen: (open: boolean) => void;
   setMobilePanelOpen: (open: boolean) => void;
+  toggleSection: (id: string, open: boolean) => void;
   hydratePreferences: () => void;
 }
 
 const PREFS_KEY = 'motion-ui-preferences';
 
-type UIPreferences = Pick<UIState, 'theme' | 'leftCollapsed' | 'rightCollapsed' | 'tplCollapsed'>;
+type UIPreferences = Pick<UIState, 'theme' | 'leftCollapsed' | 'rightCollapsed' | 'tplCollapsed' | 'sectionsOpen'>;
 
 function savePreferences(prefs: UIPreferences) {
   if (typeof window === 'undefined') return;
@@ -37,6 +42,7 @@ function savePreferences(prefs: UIPreferences) {
     leftCollapsed: prefs.leftCollapsed,
     rightCollapsed: prefs.rightCollapsed,
     tplCollapsed: prefs.tplCollapsed,
+    sectionsOpen: prefs.sectionsOpen,
   }));
   document.documentElement.dataset.theme = prefs.theme;
 }
@@ -51,6 +57,7 @@ export const useUIStore = create<UIState>((set) => ({
   mobileTab: 'templates',
   mobileProjectsOpen: false,
   mobilePanelOpen: false,
+  sectionsOpen: {},
   setNav: (nav) => set(nav === 'projects' ? { nav } : { nav, lastEditorNav: nav }),
   toggleTheme: () => set((state) => {
     const next = { ...state, theme: state.theme === 'dark' ? 'light' as const : 'dark' as const };
@@ -75,6 +82,11 @@ export const useUIStore = create<UIState>((set) => ({
   setMobileTab: (mobileTab) => set({ mobileTab, mobilePanelOpen: true }),
   setMobileProjectsOpen: (mobileProjectsOpen) => set({ mobileProjectsOpen }),
   setMobilePanelOpen: (mobilePanelOpen) => set({ mobilePanelOpen }),
+  toggleSection: (id, open) => set((state) => {
+    const sectionsOpen = { ...state.sectionsOpen, [id]: open };
+    savePreferences({ ...state, sectionsOpen });
+    return { sectionsOpen };
+  }),
   hydratePreferences: () => set((state) => {
     if (typeof window === 'undefined') return {};
     let saved: Partial<UIPreferences> = {};
@@ -87,6 +99,11 @@ export const useUIStore = create<UIState>((set) => ({
       leftCollapsed: saved.leftCollapsed ?? state.leftCollapsed,
       rightCollapsed: saved.rightCollapsed ?? state.rightCollapsed,
       tplCollapsed: saved.tplCollapsed ?? state.tplCollapsed,
+      // Only an object survives; a corrupted or older key must not poison every
+      // section lookup with undefined-shaped data.
+      sectionsOpen: saved.sectionsOpen && typeof saved.sectionsOpen === 'object'
+        ? saved.sectionsOpen
+        : state.sectionsOpen,
     };
     savePreferences({ ...state, ...next });
     return next;

@@ -41,6 +41,50 @@ function partKeyOf(mesh: THREE.Mesh): string {
   return nm.replace(/[._\-\s]?\d+$/, '') || nm;
 }
 
+// The average colour of a base-colour map, in the renderer's working space.
+// Cached per image: the enclosure scan runs once per load, but a device can
+// share one map across a dozen materials.
+const texAvgCache = new WeakMap<object, THREE.Color | null>();
+function averageTextureColor(tex: THREE.Texture | null): THREE.Color | null {
+  const img: any = tex?.image;
+  if (!img || !img.width || !img.height) return null;
+  const hit = texAvgCache.get(img);
+  if (hit !== undefined) return hit;
+  let out: THREE.Color | null = null;
+  const S = 16;   // the panel's average, not its detail — 256 texels is plenty
+  const cv = document.createElement('canvas');
+  cv.width = S; cv.height = S;
+  const ctx = cv.getContext('2d', { willReadFrequently: true });
+  if (ctx) {
+    try {
+      ctx.drawImage(img, 0, 0, S, S);
+      const d = ctx.getImageData(0, 0, S, S).data;
+      let r = 0, g = 0, b = 0, n = 0;
+      for (let i = 0; i < d.length; i += 4) {
+        if (d[i + 3] < 128) continue;    // a cut-out texel is not the panel's colour
+        r += d[i]; g += d[i + 1]; b += d[i + 2]; n++;
+      }
+      // Texture pixels are sRGB-encoded; decode into the working space so this
+      // compares against baseColorFactor, which glTF already stores linear.
+      if (n) out = new THREE.Color().setRGB(r / n / 255, g / n / 255, b / n / 255, THREE.SRGBColorSpace);
+    } catch { out = null; }   // a tainted or undecodable image is not fatal
+  }
+  texAvgCache.set(img, out);
+  return out;
+}
+
+// What a material actually LOOKS like, as opposed to what its flat colour
+// says. A textured panel carries its colour in the map with baseColorFactor
+// left at white, so reading the factor alone reports white for every one of
+// them — which is why the Finish scan matched 0 of 22 materials on iPad Air
+// and 1 of 28 on iPad Pro, while matching 14 of 31 on the iPhone, whose
+// enclosure bakes its oranges into the factor instead.
+function effectiveColorOf(m: any): THREE.Color {
+  const base = (m.userData.origColor as THREE.Color).clone();
+  const avg = averageTextureColor(m.userData.srcMap as THREE.Texture | null);
+  return avg ? base.multiply(avg) : base;
+}
+
 export function initMockup(
   stage: HTMLElement,
   canvas: HTMLCanvasElement,
@@ -100,6 +144,16 @@ export function initMockup(
   // The taps are laid on a golden-angle spiral, which covers the disc evenly at
   // any count instead of leaving the ring artefacts a concentric pattern gives.
   const blurRT = new THREE.WebGLRenderTarget(2, 2, { type: THREE.HalfFloatType, depthBuffer: true, stencilBuffer: false });
+  // GRAIN: the taps read from a MIP level whose texels are as wide as the gap
+  // between taps, so every tap already averages the ground it stands on and the
+  // gaps stop showing up as noise. This is the whole reason exports grained and
+  // the preview did not — the radius is a fraction of frame HEIGHT, so a 4K
+  // export spreads the same 32 taps over four times the pixels the preview did
+  // and undersamples the disc four times as badly. Sampling by tap SPACING is
+  // resolution-independent: the two now look the same at any size.
+  blurRT.texture.minFilter = THREE.LinearMipmapLinearFilter;
+  blurRT.texture.magFilter = THREE.LinearFilter;
+  blurRT.texture.generateMipmaps = true;
   const blurCam = new THREE.OrthographicCamera(-1, 1, 1, -1, -1, 1);
   const blurScene = new THREE.Scene();
   const blurMat = new THREE.ShaderMaterial({
@@ -114,7 +168,13 @@ export function initMockup(
       uFalloff: { value: 0.53 },
       uAspect: { value: 1 },
       uBokeh: { value: 0 },
+      uPxHeight: { value: 1080 },
       uCentre: { value: new THREE.Vector2(0.5, 0.5) },
+      uShape: { value: 0 },        // aperture preset, see BOKEH_SHAPES
+      uCA: { value: 0 },           // lateral chromatic aberration, in UV per unit radius
+      uCAMode: { value: 0 },       // 0 none · 1 radial · 2 fringe · 3 horizontal
+      uMotion: { value: 0 },       // smear length in v-units, before the mask
+      uMotionAngle: { value: 0 },  // radians, screen space
     },
     vertexShader: `
       varying vec2 vUv;
@@ -122,11 +182,44 @@ export function initMockup(
     `,
     fragmentShader: `
       uniform sampler2D tDiffuse;
-      uniform float uStrength, uFocus, uFalloff, uAspect, uBokeh;
+      uniform float uStrength, uFocus, uFalloff, uAspect, uBokeh, uPxHeight;
+      uniform float uShape, uCA, uCAMode, uMotion, uMotionAngle;
       uniform vec2 uCentre;
       varying vec2 vUv;
       const int SAMPLES = 32;
       const float GOLDEN = 2.399963229728653;
+      const float PI = 3.14159265;
+
+      // One tap, optionally split into three. Lateral chromatic aberration is a
+      // magnification difference between wavelengths, so it is a SCALE about the
+      // lens axis (frame centre), not a constant offset — which is why it is
+      // invisible in the middle of the frame and strongest in the corners, the
+      // way a real lens behaves. Splitting inside the tap loop rather than on
+      // the finished pixel is what puts the colour on the RIM of each bokeh
+      // disc instead of smearing the whole frame; it costs three fetches per
+      // tap, which is why it is an opt-in preset and not always on.
+      vec4 fetch(vec2 uv, float lod) {
+        if (uCA <= 0.0) return texture2DLodEXT(tDiffuse, uv, lod);
+        vec2 rel = uv - vec2(0.5);
+        rel.x *= uAspect;
+        // Anamorphic elements only bend one axis, so their fringing is purely
+        // horizontal — no vertical component at all.
+        vec2 axis = uCAMode > 2.5 ? vec2(1.0, 0.0) : vec2(1.0, 1.0);
+        vec2 d = rel * uCA * axis;
+        d.x /= uAspect;
+        // Fringe mode pushes red and blue the SAME way and pulls green back,
+        // which is the magenta-core/green-edge signature of a fast lens wide
+        // open, rather than the symmetric red/blue split of plain lateral CA.
+        float gk = uCAMode > 1.5 && uCAMode < 2.5 ? -0.5 : 0.0;
+        vec4 g = texture2DLodEXT(tDiffuse, uv + d * gk, lod);
+        return vec4(
+          texture2DLodEXT(tDiffuse, uv + d, lod).r,
+          g.g,
+          texture2DLodEXT(tDiffuse, uv - d, lod).b,
+          g.a
+        );
+      }
+
       void main() {
         // Distance from the focus point, corrected so the focus region is a
         // circle on a non-square canvas rather than an ellipse.
@@ -135,8 +228,12 @@ export function initMockup(
         float d = length(c) * 2.0;
         float mask = smoothstep(uFocus, uFocus + max(uFalloff, 0.001), d);
         float radius = uStrength * mask;
-        vec4 base = texture2D(tDiffuse, vUv);
-        if (radius < 0.0005) {
+        // The smear rides the same mask as the defocus, so it lives only in the
+        // out-of-focus region — a subject that is sharp stays sharp, which is
+        // what separates this from a whole-frame motion blur.
+        float mlen = uMotion * mask;
+        vec4 base = fetch(vUv, 0.0);
+        if (radius < 0.0005 && mlen < 0.0005) {
           gl_FragColor = base;
         } else {
           vec4 sum = vec4(0.0);
@@ -144,25 +241,97 @@ export function initMockup(
           // Spin each pixel's spiral by its own angle. A shared tap pattern
           // undersamples a wide disc the same way everywhere, which is what
           // prints those faint concentric echoes around a hard edge; rotating
-          // per pixel breaks the correlation and spends the error as fine
-          // grain instead. Keyed on gl_FragCoord, so it is fixed in screen
-          // space and cannot shimmer between frames of an animation.
-          float spin = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453) * 6.2831853;
+          // per pixel breaks the correlation. Interleaved gradient noise, not
+          // the fract/sin hash: the hash clumps, and a clumped set of angles is
+          // exactly the speckle this pass used to leave behind. Keyed on
+          // gl_FragCoord, so it is fixed in screen space and cannot shimmer
+          // between frames of an animation.
+          float ign = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+          float spin = ign * 6.2831853;
+
+          // Direction out from the LENS AXIS, not from the focus point. The
+          // shapes that come from mechanical vignetting — cat's eye, swirl —
+          // are cut by the barrel, so they orient to the frame centre and stay
+          // put when the focus point is racked somewhere off-centre.
+          vec2 fc = vUv - vec2(0.5);
+          fc.x *= uAspect;
+          float fr = clamp(length(fc) * 2.0, 0.0, 1.0);
+          vec2 fdir = fr > 0.0001 ? fc / (length(fc) + 1e-6) : vec2(1.0, 0.0);
+          vec2 ftan = vec2(-fdir.y, fdir.x);
+          vec2 mdir = vec2(cos(uMotionAngle), sin(uMotionAngle));
+
+          // How far apart the taps land, in texels — the disc spreads them one
+          // way, the smear the other, so take whichever gap is wider. N taps
+          // over a disc of radius R sit sqrt(PI/N)*R apart; a streak of length
+          // L just divides by N. Radius is a fraction of frame HEIGHT, so
+          // uPxHeight converts either to pixels. Reading the mip level whose
+          // texels are that wide makes each tap an average of the gap it owns
+          // rather than a point sample of one spot in it — which is the whole
+          // grain fix: it is resolution-independent, so a 4K export and the
+          // preview undersample by exactly the same (zero) amount. The half
+          // level of bias keeps a little detail; landing exactly on the level
+          // reads slightly soft.
+          float discSp = radius * uPxHeight * sqrt(PI / float(SAMPLES));
+          float streakSp = mlen * uPxHeight / float(SAMPLES);
+          float lod = max(0.0, log2(max(max(discSp, streakSp), 1.0)) - 0.5);
+
           for (int i = 0; i < SAMPLES; i++) {
             float fi = float(i);
             // sqrt keeps the spiral area-uniform; without it the taps bunch up
             // in the middle and the disc reads as a soft dot.
-            float r = sqrt((fi + 0.5) / float(SAMPLES)) * radius;
+            float rn = sqrt((fi + 0.5) / float(SAMPLES));
             float a = fi * GOLDEN + spin;
-            vec2 off = vec2(cos(a), sin(a)) * r;
+            vec2 unit = vec2(cos(a), sin(a)) * rn;
+            float shape = 1.0;
+
+            if (uShape > 0.5 && uShape < 1.5) {
+              // SWIRL. A fast double-Gauss vignettes its own bokeh: off-axis,
+              // the barrel clips the disc into a lemon whose long axis is
+              // TANGENTIAL. Squeezing radially and stretching tangentially, both
+              // harder towards the corners, is what makes the background appear
+              // to rotate around the subject.
+              unit = fdir * dot(unit, fdir) * mix(1.0, 0.45, fr)
+                   + ftan * dot(unit, ftan) * mix(1.0, 1.30, fr);
+              shape *= 1.0 - smoothstep(0.85, 1.05, length(unit - fdir * fr * 0.55));
+            } else if (uShape > 1.5 && uShape < 2.5) {
+              // SOAP BUBBLE. An aspherical element leaves a hard bright rim and
+              // a hollow middle instead of an evenly filled disc.
+              shape *= mix(0.35, 1.0, smoothstep(0.0, 0.75, rn)) + 3.0 * smoothstep(0.62, 1.0, rn);
+            } else if (uShape > 2.5 && uShape < 3.5) {
+              // ANAMORPHIC. A cylindrical front element squeezes one axis only,
+              // so the disc becomes the familiar wide oval.
+              unit.x *= 1.20;
+              unit.y *= 0.42;
+            } else if (uShape > 3.5 && uShape < 4.5) {
+              // CAT'S EYE. The barrel cuts the disc against an aperture that
+              // slides further off-centre the further out the pixel sits — round
+              // in the middle of the frame, a crescent in the corners.
+              shape *= 1.0 - smoothstep(0.80, 1.02, length(unit - fdir * fr * 0.95));
+            } else if (uShape > 4.5) {
+              // HEXAGONAL. A stopped-down six-blade iris. Pushing the unit disc
+              // out to the polygon's edge for each angle fills the hexagon
+              // evenly instead of inscribing a circle in it.
+              float seg = PI / 3.0;
+              unit *= cos(seg * 0.5) / cos(mod(a, seg) - seg * 0.5);
+            }
+
+            vec2 off = unit * radius;
+            // Linear smear along the motion vector: a box filter over the
+            // exposure, convolved with whatever aperture shape is above. ign
+            // dithers the position inside the step so 32 taps do not print 32
+            // discrete ghosts along the streak.
+            off += mdir * (((fi + ign) / float(SAMPLES)) - 0.5) * mlen;
             off.x /= uAspect;             // offsets stay circular on screen
-            vec4 s = texture2D(tDiffuse, vUv + off);
+            vec4 s = fetch(vUv + off, lod);
+            // The bokeh weight is read off the SAME mip-averaged tap, so a lone
+            // clipped highlight can no longer win a tap by 7x and print itself
+            // as a bright speck in an otherwise smooth field.
             float lum = max(max(s.r, s.g), s.b);
-            float w = mix(1.0, 1.0 + lum * lum * lum * 6.0, uBokeh);
+            float w = mix(1.0, 1.0 + lum * lum * lum * 6.0, uBokeh) * shape;
             sum += s * w;
             wsum += w;
           }
-          gl_FragColor = sum / wsum;
+          gl_FragColor = wsum > 0.0001 ? sum / wsum : base;
         }
         // Encode for the display. Deliberately NO <tonemapping_fragment>: the
         // target already holds tone-mapped values (see the note above the
@@ -173,6 +342,27 @@ export function initMockup(
     `,
   });
   blurScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), blurMat));
+
+  // Aperture presets, in the order the Bokeh Shape control lists them. Named
+  // for the optical cause rather than for any maker's lens line — the shapes
+  // are what mechanical vignetting, an aspherical element, a cylindrical front
+  // element and a bladed iris actually do, so the names say that.
+  const BOKEH_SHAPES = ['Round', 'Swirl', 'Soap Bubble', 'Anamorphic', "Cat's Eye", 'Hexagonal'];
+
+  // Chromatic aberration presets: [magnification difference at the frame edge,
+  // mode]. Mode picks how the channels split — 1 spreads red out and blue in
+  // (plain lateral CA), 2 is the magenta-core/green-edge fringe of a fast lens
+  // wide open, 3 confines the split to the horizontal axis, which is all a
+  // cylindrical anamorphic element can produce.
+  const CA_PRESETS: Record<string, [number, number]> = {
+    'Off': [0, 0],
+    'Subtle': [0.0018, 1],
+    'Lens': [0.0045, 1],
+    'Purple Fringe': [0.0075, 2],
+    'Prism': [0.0120, 1],
+    'Anamorphic': [0.0065, 3],
+  };
+  const caPreset = (v: unknown): [number, number] => CA_PRESETS[String(v ?? 'Off')] ?? CA_PRESETS['Off'];
 
   // ── Stage background, baked into the scene ──────────────────────────────
   // The backdrop used to live only in CSS on the stage div, with the canvas
@@ -246,6 +436,117 @@ export function initMockup(
   const fill = new THREE.DirectionalLight(0xffffff, 1.8); fill.position.set(-4, 2, -3); scene.add(fill);
   const rim = new THREE.DirectionalLight(0xffffff, 2.5); rim.position.set(-2, 4, -4); scene.add(rim);
 
+  // ── Lighting presets ────────────────────────────────────────────────────
+  // Each preset is a set of MULTIPLIERS over the four sliders, not a set of
+  // replacement values: the Key/Fill/Ambient/Reflections sliders have to stay
+  // live once a preset is picked, the same way the animation presets' own light
+  // choreography multiplies rather than overwrites. Default is the identity, so
+  // picking it returns the rig exactly to the shipped look.
+  //
+  // `az`/`el` nudge the key in degrees on top of the user's Light Direction,
+  // `soft` scales the penumbra, and the colours are the actual point of most of
+  // these — a lighting look is a colour relationship between key, fill and rim
+  // far more than it is an intensity one.
+  type LightPreset = {
+    key: number; fill: number; rim: number; ambient: number; env: number;
+    keyColor: number; fillColor: number; rimColor: number; ambientColor: number;
+    az: number; el: number; soft: number;
+    fillPos?: [number, number, number];
+    rimPos?: [number, number, number];
+  };
+  const DEFAULT_FILL_POS: [number, number, number] = [-4, 2, -3];
+  const DEFAULT_RIM_POS: [number, number, number] = [-2, 4, -4];
+  const LIGHT_PRESETS: Record<string, LightPreset> = {
+    // The rig as shipped. Every field is an identity so this is a true no-op.
+    'Default': {
+      key: 1, fill: 1, rim: 1, ambient: 1, env: 1,
+      keyColor: 0xffffff, fillColor: 0xffffff, rimColor: 0xffffff, ambientColor: 0xffffff,
+      az: 0, el: 0, soft: 1,
+    },
+    // A big softbox close in: the key comes down, everything else comes up, and
+    // the penumbra widens a lot. Low contrast and almost no visible shadow edge
+    // — the look a product shot gets in a white cyc.
+    'Studio Soft': {
+      key: 0.70, fill: 1.70, rim: 0.55, ambient: 1.55, env: 1.15,
+      keyColor: 0xfffaf4, fillColor: 0xf4f7ff, rimColor: 0xffffff, ambientColor: 0xfbfbff,
+      az: -8, el: 14, soft: 2.6,
+      fillPos: [-3, 3, -1.5],
+    },
+    // Almost everything off except a hard light raking from behind, which is
+    // what draws the bright outline down one edge of the device. The ambient
+    // floor has to go nearly to zero or the rim has nothing to read against.
+    'Dark Rim': {
+      key: 0.32, fill: 0.12, rim: 3.0, ambient: 0.14, env: 0.65,
+      keyColor: 0xdfe6f5, fillColor: 0x8fa4c8, rimColor: 0xeaf2ff, ambientColor: 0x9fb0cc,
+      az: 26, el: -6, soft: 0.45,
+      rimPos: [-1.4, 2.6, -6.5],
+    },
+    // The warm-key/cool-fill split. Both sides are pushed up so neither reads as
+    // a shadow — the point is two colours meeting on the body, not a bright side
+    // and a dark one.
+    'Two Tone': {
+      key: 1.05, fill: 1.85, rim: 1.25, ambient: 0.55, env: 0.95,
+      keyColor: 0xffb478, fillColor: 0x6f9dff, rimColor: 0x8fb6ff, ambientColor: 0xa8b6d8,
+      az: -20, el: 6, soft: 1.2,
+      fillPos: [-5, 1.5, -2],
+    },
+    // Low, late sun: everything warm, the key dropped towards the horizon so it
+    // rakes across the body, and a wide penumbra because a low sun through haze
+    // is a big source.
+    'Warm Glow': {
+      key: 1.15, fill: 1.05, rim: 1.10, ambient: 1.25, env: 1.05,
+      keyColor: 0xffd49a, fillColor: 0xffc08e, rimColor: 0xffd9a8, ambientColor: 0xffe8cf,
+      az: -12, el: -10, soft: 1.9,
+    },
+  };
+  const lightPresetOf = (v: unknown): LightPreset =>
+    LIGHT_PRESETS[String(v ?? 'Default')] ?? LIGHT_PRESETS['Default'];
+
+  // Single owner of the rig, called by both render paths. It used to be two
+  // near-identical copies, and they had already drifted: only the preview one
+  // set the rim, so an export kept whatever intensity the last preview frame
+  // happened to leave on it.
+  type LightChoreography = {
+    keyLightAzimuth: number; keyLightElevation: number;
+    keyLightIntensity: number; fillLightIntensity: number; envRotation: number;
+  };
+  function applyLightRig(p: Record<string, unknown>, ls: LightChoreography) {
+    const lp = lightPresetOf(p.lightPreset);
+    // The animation preset's own light choreography, PLUS the user's Light
+    // Direction, PLUS the lighting preset's nudge — all added as offsets rather
+    // than replacing each other, so dragging the direction still works while an
+    // animated preset is playing under a lighting preset.
+    const kAz = THREE.MathUtils.degToRad(ls.keyLightAzimuth + Number(p.lightAzimuth ?? 0) + lp.az);
+    const kEl = THREE.MathUtils.degToRad(ls.keyLightElevation + Number(p.lightElevation ?? 0) + lp.el);
+    const kDist = 8;
+    key.position.set(
+      kDist * Math.cos(kEl) * Math.sin(kAz),
+      kDist * Math.sin(kEl),
+      kDist * Math.cos(kEl) * Math.cos(kAz)
+    );
+    fill.position.set(...(lp.fillPos ?? DEFAULT_FILL_POS));
+    rim.position.set(...(lp.rimPos ?? DEFAULT_RIM_POS));
+    key.color.setHex(lp.keyColor);
+    fill.color.setHex(lp.fillColor);
+    rim.color.setHex(lp.rimColor);
+    ambient.color.setHex(lp.ambientColor);
+    // Multiply the user's own Key/Fill sliders by the preset's choreography —
+    // multiplying a hardcoded base here (as before) made those two sliders do
+    // nothing, since this assignment runs after (and overwrote) the one above.
+    key.intensity = Number(p.keyLight ?? 3) * ls.keyLightIntensity * lp.key;
+    fill.intensity = Number(p.fillLight ?? 1.2) * ls.fillLightIntensity * lp.fill;
+    // The rim has no slider of its own; it has always tracked the key at the
+    // ratio the rig shipped with (2.5 / 4.2), so a preset scales that ratio.
+    rim.intensity = Number(p.keyLight ?? 3) * (2.5 / 4.2) * ls.keyLightIntensity * lp.rim;
+    ambient.intensity = Number(p.ambient ?? 0.6) * lp.ambient;
+    // Source size, expressed as the penumbra it throws. /10 puts the shipped
+    // rig (radius 1.5) exactly on the slider's own default of 15.
+    key.shadow.radius = Math.max(0.1, (Number(p.lightSoftness ?? 15) / 10) * lp.soft);
+    if ((scene as any).environmentRotation) {
+      (scene as any).environmentRotation.y = THREE.MathUtils.degToRad(ls.envRotation);
+    }
+  }
+
   // Accent "window" light — same gobo-mask pattern as the Cartoon effect, so
   // the Background panel's Sunlight/Sun Shadow/Sun Mask controls stay live.
   const sun = new THREE.SpotLight(0xffffff, 0.0, 0, 0.62, 0.18, 0.0);
@@ -317,10 +618,13 @@ export function initMockup(
   let modelHalf = MODEL_SIZE / 2;
   let modelBottom = -modelHalf;
   let groundBaseY = -modelHalf;   // shadow-catcher height at the model's resting base
-  // Default view — a slight 3/4 turn to the right + a touch of elevation
-  // (classic product-shot angle) instead of a flat, dead-on front view.
-  const INIT_AZIMUTH = THREE.MathUtils.degToRad(28);
-  const INIT_ELEVATION = THREE.MathUtils.degToRad(8);
+  // Default view — dead-on front. The camera used to sit at a 3/4 product-shot
+  // angle (28deg azimuth, 8deg elevation), which made Rotate 0/0/0 in Model
+  // Control show an angled device: the sliders read zero while the viewport
+  // plainly wasn't. The hero angle belongs in the Rotate values, where it is
+  // visible and resettable, not baked into the camera. Matches cartoon.ts.
+  const INIT_AZIMUTH = 0;
+  const INIT_ELEVATION = 0;
   function frameCamera() {
     const halfV = Math.tan((45 * Math.PI / 180) / 2);
     const halfH = halfV * camera.aspect;
@@ -840,7 +1144,12 @@ export function initMockup(
   // materials on the enclosure alone, spread across a whole family of oranges
   // (#db6018, #fb7c4a, #ed754a, …) that bake in its shading. Matching one exact
   // value catches a single sliver of trim; matching the family catches the body.
-  const HUE_TOL = 0.055;        // ±20° around the shipped hue
+  // ±32° around the shipped hue. It was ±20°, which is wide enough for the
+  // iPhone (its enclosure family sits within 4° of the shipped orange) but not
+  // for iPad Air, whose authored blues land at hue 0.515-0.542 against a listed
+  // #8f9fb5 at 0.603 — a 22-32° gap that fell just outside the old band and
+  // left the whole body unmatched.
+  const HUE_TOL = 0.09;
   const MIN_SAT = 0.12;         // below this a colour has no meaningful hue
   const NEUTRAL_L_TOL = 0.35;   // lightness band for silver-bodied devices
   const shippedHSL = { h: 0, s: 0, l: 0 };
@@ -855,16 +1164,40 @@ export function initMockup(
     const neutral = shippedHSL.s < 0.1;
     const hsl = { h: 0, s: 0, l: 0 };
 
-    for (const m of materials as any[]) {
+    // A neutral device has no hue to match on, and the lightness band alone is
+    // far too blunt for a dark one: Space Black ships at l 0.09, so a +/-0.35
+    // band admits every black bezel, camera ring and port trim on the mesh and
+    // the Finish repaints the whole handset. The enclosure is, however, the
+    // only thing on a device that is PANEL-SIZED, so the neutral path requires
+    // that as well. Measured as the largest face of the mesh's own bounding
+    // box against the largest face in the model, before fitAndCenter — a
+    // ratio, so the model's authored units do not matter.
+    const faceArea = (i: number) => {
+      const geo = meshList[i]?.geometry;
+      if (!geo) return 0;
+      if (!geo.boundingBox) geo.computeBoundingBox();
+      const bb = geo.boundingBox;
+      if (!bb) return 0;
+      const d = [bb.max.x - bb.min.x, bb.max.y - bb.min.y, bb.max.z - bb.min.z].sort((a, b) => b - a);
+      return d[0] * d[1];
+    };
+    const faces = materials.map((_, i) => faceArea(i));
+    const maxFace = Math.max(...faces, 1e-9);
+    const PANEL_FRAC = 0.12;
+
+    for (let i = 0; i < materials.length; i++) {
+      const m = materials[i] as any;
       if (m.userData.partKey === 'Screen') continue;
-      (m.userData.origColor as THREE.Color).getHSL(hsl);
+      effectiveColorOf(m).getHSL(hsl);
       m.userData.origL = hsl.l;
       m.userData.origS = hsl.s;
       const dh = Math.min(Math.abs(hsl.h - shippedHSL.h), 1 - Math.abs(hsl.h - shippedHSL.h));
       m.userData.isEnclosure = neutral
         // A silver body has no hue to match on, so match "unsaturated, and about
         // as light as the shipped finish" instead.
-        ? hsl.s < 0.15 && Math.abs(hsl.l - shippedHSL.l) <= NEUTRAL_L_TOL
+        ? hsl.s < 0.15
+          && Math.abs(hsl.l - shippedHSL.l) <= NEUTRAL_L_TOL
+          && faces[i] >= PANEL_FRAC * maxFace
         : hsl.s >= MIN_SAT && dh <= HUE_TOL;
     }
   }
@@ -882,6 +1215,46 @@ export function initMockup(
         && size.y >= 0.14
         && geo.boundingBox.max.z <= 0.001;
       if (isStableRearPanel) (materials[i] as any).userData.isEnclosure = true;
+    }
+  }
+
+  // ── Panels shipped in the wrong PBR class ───────────────────────────────
+  // Three bundled meshes author a large enclosure surface as metalness 0 while
+  // every neighbouring panel of the same unibody is metallic. That is not a
+  // subtle difference to a PBR renderer: a non-metal takes no environment
+  // reflection, so under the studio rig the panel paints as a flat slab while
+  // the metal around it grades. It is what makes both iPads look like they are
+  // wearing a grey cover across the lower two thirds of the back, and what
+  // leaves the MacBook's speaker strip a dead black band.
+  //
+  // The geometry is correct — nothing extends past the body — so only the
+  // material class is repaired, and it is COPIED from a named sibling panel on
+  // the same mesh rather than invented, which keeps each device's own authored
+  // finish (the iPads' shells differ: roughness 1 on the Pro, 0.2 on the Air).
+  // Keyed by material name: machine-generated, but stable inside these
+  // committed assets. A name that no longer resolves is a silent no-op, so a
+  // re-exported mesh degrades to today's appearance instead of throwing.
+  const MATTE_PANEL_FIXUPS: Record<string, Array<{ panel: string; copyFrom?: string }>> = {
+    ipadpro:   [{ panel: 'WHeurdvnNmzlaVj', copyFrom: 'AQYGetoGtanvwug' }],
+  };
+
+  function repairMattePanels() {
+    const fixes = DEV ? MATTE_PANEL_FIXUPS[DEV.key] : undefined;
+    if (!fixes) return;
+    const byKey = (name: string) =>
+      (materials as any[]).find((m) => m.userData.partKey === name);
+    for (const { panel, copyFrom } of fixes) {
+      const target = byKey(panel);
+      if (!target) continue;
+      const source = copyFrom ? byKey(copyFrom) : null;
+      if (source) {
+        target.metalness = source.metalness;
+        target.roughness = source.roughness;
+      }
+      // The micro-roughness noise multiplies against this baseline, so it has
+      // to move with the roughness or the panel keeps the old surface response.
+      if (source) target.userData.origRoughness = source.roughness;
+      target.needsUpdate = true;
     }
   }
 
@@ -1028,6 +1401,7 @@ export function initMockup(
         meshList.push(mesh);
         if (!keys.includes(key)) keys.push(key);
       });
+      repairMattePanels();
       markEnclosureMaterials();
       markIPhoneAirRearPanelAsEnclosure();
       modelHalf = fitAndCenter(model, MODEL_SIZE);
@@ -1085,7 +1459,11 @@ export function initMockup(
   function renderComposited() {
     scene.background = transparentBg ? null : bgTex;
     const strength = Number(P().blurStrength ?? 0);
-    if (strength <= 0) {
+    // Chromatic aberration is a property of the LENS, not of the defocus, so it
+    // has to be able to run on a frame that is sharp everywhere. Without this
+    // the preset silently did nothing until someone also raised Blur.
+    const caOn = caPreset(P().blurCA)[0] > 0;
+    if (strength <= 0 && !caOn) {
       renderer.setRenderTarget(null);
       renderer.render(scene, camera);
       return;
@@ -1106,6 +1484,17 @@ export function initMockup(
     blurMat.uniforms.uFalloff.value = Number(p.blurFalloff ?? 0.53);
     blurMat.uniforms.uAspect.value = _bufSize.x / Math.max(1, _bufSize.y);
     blurMat.uniforms.uBokeh.value = isOn(p.blurBokeh) ? 1 : 0;
+    // Drives the mip pick in the defocus shader — see the note on blurRT.
+    blurMat.uniforms.uPxHeight.value = Math.max(1, _bufSize.y);
+    const shapeIdx = BOKEH_SHAPES.indexOf(String(p.blurShape ?? 'Round'));
+    blurMat.uniforms.uShape.value = shapeIdx < 0 ? 0 : shapeIdx;
+    const ca = caPreset(p.blurCA);
+    blurMat.uniforms.uCA.value = ca[0];
+    blurMat.uniforms.uCAMode.value = ca[1];
+    // Smear length as a fraction of frame height, same unit the radius uses, so
+    // it survives a resolution change the way the defocus does.
+    blurMat.uniforms.uMotion.value = (Math.max(0, Number(p.blurMotion ?? 0)) / 100) * 0.09;
+    blurMat.uniforms.uMotionAngle.value = (Number(p.blurMotionAngle ?? 0) * Math.PI) / 180;
     // UV origin is bottom-left; the picked point arrives in top-down viewport
     // space, so Y is stored as the user sees it and flipped here.
     blurMat.uniforms.uCentre.value.set(Number(p.blurFocusX ?? 0.5), 1 - Number(p.blurFocusY ?? 0.5));
@@ -1121,10 +1510,10 @@ export function initMockup(
     animId = requestAnimationFrame(loop);
     const p = P();
 
-    key.intensity = Number(p.keyLight ?? 3);
-    fill.intensity = Number(p.fillLight ?? 1.2);
-    ambient.intensity = Number(p.ambient ?? 0.6);
-    const envIntensity = Number(p.envIntensity ?? 1);
+    // key/fill/ambient are settled properly by applyLightRig() further down;
+    // only the environment multiplier is read here, because it reaches the
+    // materials through the walk below rather than through a light.
+    const envIntensity = Number(p.envIntensity ?? 1) * lightPresetOf(p.lightPreset).env;
     // Exposure is applied per material group rather than through the renderer's
     // global tone mapping, so the body and the front face (cover glass, bezel,
     // Dynamic Island) can be lit separately. The renderer itself stays pinned at
@@ -1363,29 +1752,7 @@ export function initMockup(
     );
 
     // Dynamic studio lighting choreography synced with camera animation
-    // The animation preset's own light choreography, PLUS the user's Light
-    // Direction — added as an offset rather than replacing it, so dragging the
-    // direction still works while an animated preset is playing.
-    const kAz = THREE.MathUtils.degToRad(lightState.keyLightAzimuth + Number(p.lightAzimuth ?? 0));
-    const kEl = THREE.MathUtils.degToRad(lightState.keyLightElevation + Number(p.lightElevation ?? 0));
-    const kDist = 8;
-    key.position.set(
-      kDist * Math.cos(kEl) * Math.sin(kAz),
-      kDist * Math.sin(kEl),
-      kDist * Math.cos(kEl) * Math.cos(kAz)
-    );
-    // Multiply the user's own Key/Fill sliders by the preset's choreography —
-    // multiplying a hardcoded base here (as before) made those two sliders do
-    // nothing, since this assignment runs after (and overwrote) the one above.
-    key.intensity = Number(p.keyLight ?? 3) * lightState.keyLightIntensity;
-    fill.intensity = Number(p.fillLight ?? 1.2) * lightState.fillLightIntensity;
-    // Source size, expressed as the penumbra it throws. /10 puts the shipped
-    // rig (radius 1.5) exactly on the slider's own default of 15.
-    key.shadow.radius = Math.max(0.1, Number(p.lightSoftness ?? 15) / 10);
-    rim.intensity = Number(p.keyLight ?? 3) * (2.5 / 4.2) * lightState.keyLightIntensity;
-    if ((scene as any).environmentRotation) {
-      (scene as any).environmentRotation.y = THREE.MathUtils.degToRad(lightState.envRotation);
-    }
+    applyLightRig(p, lightState);
 
     // Repaints only when the Background panel actually changes (keyed on the
     // fill spec), so this is a string compare per frame, not a canvas redraw.
@@ -1451,25 +1818,7 @@ export function initMockup(
       Number(p.fieldOfView ?? 42),
       Number(p.lidAngle ?? 112),
     );
-    // The animation preset's own light choreography, PLUS the user's Light
-    // Direction — added as an offset rather than replacing it, so dragging the
-    // direction still works while an animated preset is playing.
-    const kAz = THREE.MathUtils.degToRad(lightState.keyLightAzimuth + Number(p.lightAzimuth ?? 0));
-    const kEl = THREE.MathUtils.degToRad(lightState.keyLightElevation + Number(p.lightElevation ?? 0));
-    const kDist = 8;
-    key.position.set(
-      kDist * Math.cos(kEl) * Math.sin(kAz),
-      kDist * Math.sin(kEl),
-      kDist * Math.cos(kEl) * Math.cos(kAz)
-    );
-    key.intensity = Number(p.keyLight ?? 3) * lightState.keyLightIntensity;
-    fill.intensity = Number(p.fillLight ?? 1.2) * lightState.fillLightIntensity;
-    // Source size, expressed as the penumbra it throws. /10 puts the shipped
-    // rig (radius 1.5) exactly on the slider's own default of 15.
-    key.shadow.radius = Math.max(0.1, Number(p.lightSoftness ?? 15) / 10);
-    if ((scene as any).environmentRotation) {
-      (scene as any).environmentRotation.y = THREE.MathUtils.degToRad(lightState.envRotation);
-    }
+    applyLightRig(p, lightState);
     settleGroundUnderModel();   // after the animation has posed the pivot
     rig.update();
     if (controls.enabled) controls.update();

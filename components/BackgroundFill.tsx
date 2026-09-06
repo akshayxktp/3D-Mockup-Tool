@@ -6,6 +6,7 @@ import { ControlRow } from './Controls';
 import FillRow from './FillRow';
 import type { ControlDef } from '@/lib/types';
 import { fillPatchForGradient, gradientFromFill } from '@/lib/gradient';
+import { SectionHead, useSection } from './PanelSection';
 
 const BG_ALPHA: ControlDef = { key: 'bg-alpha', label: 'Alpha', type: 'slider', min: 0, max: 100, step: 1, default: 100 };
 const amtDef: ControlDef = { key: 'a', label: 'Texture Amount', type: 'slider', min: 0, max: 100, step: 1, default: 0 };
@@ -20,7 +21,8 @@ const mOffYDef: ControlDef = { key: 'my', label: 'Mask Offset Y', type: 'slider'
 // paint-stroke texture amount, plus the warm sun (masked by an alpha window).
 // `hideTexture` drops the two paint-relief rows — Mockup mode has no painted
 // wall to apply them to (its background is the stage CSS gradient).
-export default function BackgroundFill({ hideTexture }: { hideTexture?: boolean } = {}) {
+export default function BackgroundFill({ hideTexture, sectionId }: { hideTexture?: boolean; sectionId?: string } = {}) {
+  const [open, toggle] = useSection(sectionId);
   const bgFill = use3DStore((s) => s.bgFill);
   const setBgFill = use3DStore((s) => s.setBgFill);
   const bgTexAmount = use3DStore((s) => s.bgTexAmount);
@@ -44,8 +46,8 @@ export default function BackgroundFill({ hideTexture }: { hideTexture?: boolean 
 
   return (
     <>
-      <div className="section-head"><span className="eyebrow">Background</span></div>
-      <div className="section-body mc-colors">
+      <SectionHead title="Background" open={open} onToggle={toggle} />
+      {open && <div className="section-body mc-colors">
         <FillRow
           label="Fill"
           fill={bgFill}
@@ -81,7 +83,7 @@ export default function BackgroundFill({ hideTexture }: { hideTexture?: boolean 
           <ControlRow def={mOffXDef} value={sunMaskOffsetX} onChange={(v) => setSunMaskOffset(v, sunMaskOffsetY)} />
           <ControlRow def={mOffYDef} value={sunMaskOffsetY} onChange={(v) => setSunMaskOffset(sunMaskOffsetX, v)} />
         </>}
-      </div>
+      </div>}
     </>
   );
 }

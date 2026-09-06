@@ -39,6 +39,11 @@ export const mockupGroups: ControlGroup[] = [
   {
     title: 'Lights',
     controls: [
+      // A named look, applied as multipliers and colour shifts over the four
+      // sliders below rather than as replacement values — so the sliders keep
+      // working after a preset is chosen, and Default is a true no-op that
+      // returns the rig to exactly what it ships with.
+      { key: 'lightPreset', label: 'Lighting', type: 'select', options: ['Default', 'Studio Soft', 'Dark Rim', 'Two Tone', 'Warm Glow'], default: 'Default' },
       // The reference tool steers its key light from a 2D "light direction"
       // pad rather than a position; these are that pad's two axes, and its
       // measured defaults (-26°, 0°). Applied as an offset on top of whatever
@@ -80,6 +85,22 @@ export const mockupGroups: ControlGroup[] = [
       // disc instead of averaging away — the difference between "out of focus"
       // and "bokeh".
       { key: 'blurBokeh', label: 'Bokeh', type: 'toggle', options: ['On', 'Off'], default: 'Off' },
+      // Aperture shape. What a real lens leaves behind is not always a clean
+      // disc: mechanical vignetting cuts it to a lemon off-axis (Swirl, Cat's
+      // Eye), an aspherical element hollows it out (Soap Bubble), a cylindrical
+      // front element ovals it (Anamorphic), and a stopped-down iris shows its
+      // blades (Hexagonal). Shapes read strongest with Bokeh on, since that is
+      // what makes a highlight spread far enough to show its shape at all.
+      { key: 'blurShape', label: 'Bokeh Shape', type: 'select', options: ['Round', 'Swirl', 'Soap Bubble', 'Anamorphic', "Cat's Eye", 'Hexagonal'], default: 'Round' },
+      // Lateral chromatic aberration — a magnification difference between
+      // wavelengths, so it is invisible at frame centre and strongest in the
+      // corners. Runs even at Blur 0, because a lens fringes whether or not
+      // anything is out of focus.
+      { key: 'blurCA', label: 'Aberration', type: 'select', options: ['Off', 'Subtle', 'Lens', 'Purple Fringe', 'Prism', 'Anamorphic'], default: 'Off' },
+      // Directional smear applied INSIDE the defocus only, riding the same
+      // falloff mask — a moving background behind a subject that stays sharp.
+      { key: 'blurMotion', label: 'Motion Blur', type: 'slider', min: 0, max: 100, step: 1, default: 0 },
+      { key: 'blurMotionAngle', label: 'Motion Angle', type: 'slider', min: 0, max: 360, step: 1, default: 0, unit: '°' },
       // Arms the stage for a focus pick: the next click on the device drops the
       // focus point there, the way tapping a phone viewfinder racks focus.
       // Stays armed so the point can be nudged repeatedly, and suppresses

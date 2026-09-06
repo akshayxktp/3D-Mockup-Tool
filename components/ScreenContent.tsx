@@ -5,6 +5,7 @@ import { use3DStore, defaultModelFor } from '@/store/use3DStore';
 import { findDevice, SLOT_LABELS } from '@/three3d/devices';
 import { ControlRow } from './Controls';
 import type { ControlDef } from '@/lib/types';
+import { SectionHead, useSection } from './PanelSection';
 
 const zoomDef: ControlDef = { key: 'zoom', label: 'Zoom', type: 'slider', min: 0.2, max: 3, step: 0.01, default: 1 };
 const posXDef: ControlDef = { key: 'px', label: 'Position X', type: 'slider', min: 0, max: 100, step: 1, default: 50 };
@@ -27,7 +28,8 @@ const FITS: { id: 'cover' | 'width' | 'contain'; label: string }[] = [
 // Assets are held per SCREEN SLOT rather than per device, so a phone shot
 // serves every phone and swapping device keeps the artwork. The panel states
 // the panel's real native pixel size so a screenshot can be prepared to fit.
-export default function ScreenContent() {
+export default function ScreenContent({ sectionId }: { sectionId?: string } = {}) {
+  const [open, toggle] = useSection(sectionId);
   const modelUrl = use3DStore((s) => (s.models[s.effectId] ?? defaultModelFor(s.effectId)).url);
   const screenMediaBySlot = use3DStore((s) => s.screenMedia);
   const setScreenMedia = use3DStore((s) => s.setScreenMedia);
@@ -67,11 +69,13 @@ export default function ScreenContent() {
 
   return (
     <>
-      <div className="section-head">
-        <span className="eyebrow">Screen Content</span>
-        <span className="badge">{pxW} × {pxH}</span>
-      </div>
-      <div className="section-body mc-body">
+      <SectionHead
+        title="Screen Content"
+        badge={<span className="badge">{pxW} × {pxH}</span>}
+        open={open}
+        onToggle={toggle}
+      />
+      {open && <div className="section-body mc-body">
         <div className="ctl-hint">{SLOT_LABELS[slot]} — shared by every {slot} device.</div>
 
         <input
@@ -140,7 +144,7 @@ export default function ScreenContent() {
             )}
           </div>
         )}
-      </div>
+      </div>}
     </>
   );
 }

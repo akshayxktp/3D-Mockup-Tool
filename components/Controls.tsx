@@ -18,9 +18,29 @@ interface RowProps {
   onChange: (val: any) => void;
 }
 
+// Controls that cannot share a line with their label — either they are two
+// dimensional (a pad, a direction dial), they need the full width to be usable
+// (a text field, an upload target), or they are a row of pills long enough that
+// squeezing them into half a 300px panel would truncate the options.
+function needsOwnLine(def: ControlDef): boolean {
+  if (def.type === 'xypad' || def.type === 'direction' || def.type === 'upload' || def.type === 'text') return true;
+  if (def.type === 'pills') return (def.options?.length ?? 0) > 3;
+  return false;
+}
+
 export function ControlRow({ def, value, onChange }: RowProps) {
+  // A slider carries its own label INSIDE the track (see SliderControl), so
+  // printing one above it as well would say the same word twice and cost the
+  // line the inline label was there to save.
+  if (def.type === 'slider') {
+    return (
+      <div className="ctl-row ctl-row-bare" title={def.description}>
+        <div className="ctl-input">{renderControl(def, value, onChange)}</div>
+      </div>
+    );
+  }
   return (
-    <div className="ctl-row" title={def.description}>
+    <div className={`ctl-row ${needsOwnLine(def) ? '' : 'ctl-row-inline'}`} title={def.description}>
       <label className="ctl-label">{def.label}</label>
       <div className="ctl-input">{renderControl(def, value, onChange)}</div>
     </div>
@@ -254,6 +274,11 @@ function SliderControl({ def, value, onChange }: RowProps) {
       <div className={`shandle ${splitHandle ? 'is-split' : ''}`} style={{ left: handleLeft }} />
       <div className="sfill" style={{ left: `${fillLeft}%`, width: `${fillWidth}%` }} />
       {signed && <div className="szero" style={{ left: `${zeroPct}%` }} />}
+      {/* The label lives in the track, opposite the readout. That is what turns
+          a two-line control into a one-line one, and the track is already the
+          full width of the row so there is room for it. Not a <label>: it must
+          not steal the pointer from the drag surface underneath it. */}
+      <span className="slabel" aria-hidden="true">{def.label}</span>
       {mobile && dragging && <output className="slider-bubble" style={{ left: `${pct}%` }}>{num.toFixed(decimals)}{def.unit ?? ''}</output>}
       {editing ? (
         <input
@@ -326,6 +351,7 @@ function SliderControl({ def, value, onChange }: RowProps) {
           style={{ clipPath: `inset(0 ${(100 - (fillLeft + fillWidth)).toFixed(3)}% 0 ${fillLeft.toFixed(3)}%)` }}
         >
           <div className={`shandle ${splitHandle ? 'is-split' : ''}`} style={{ left: handleLeft }} />
+          <span className="slabel">{def.label}</span>
           {/* The zero anchor sits exactly where the fill begins, so on a
               signed slider it is half under the bar — a --fg tick on a --fg
               fill is nothing at all. It needs the inverted copy too. */}

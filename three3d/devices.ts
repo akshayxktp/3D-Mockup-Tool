@@ -80,9 +80,15 @@ export const DEVICES: DeviceDef[] = [
   {
     key: 'ipadpro', label: 'iPad Pro', modelUrl: '/3d/devices/ipadpro.glb', fitHeight: 1.7,
     screenAspect: 1.33, screenCornerFrac: 0.014, screenTextureTranspose: 'anti', slot: 'tablet', screenPx: [2752, 2064],
+    // Space Black first, and it has to stay first: markEnclosureMaterials()
+    // treats finishes[0] as the colour the mesh was authored in. Silver led
+    // this list, and the mesh is not silver — its rear shell samples to
+    // lightness 0.05 against Silver's 0.57, so every enclosure material fell
+    // outside the match band and the Finish control repainted nothing at all
+    // (4 of 63 materials matched, none of them the body).
     finishes: [
-      { key: 'silver', label: 'Silver', hex: '#c6c7c8' },
       { key: 'spaceblack', label: 'Space Black', hex: '#565457' },
+      { key: 'silver', label: 'Silver', hex: '#c6c7c8' },
     ],
   },
   {

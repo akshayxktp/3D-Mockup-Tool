@@ -6,6 +6,7 @@ import { use3DStore, defaultModelFor } from '@/store/use3DStore';
 import { ControlRow } from './Controls';
 import RotationBall from './RotationBall';
 import type { ControlDef } from '@/lib/types';
+import { SectionHead, useSection } from './PanelSection';
 
 const scaleDef: ControlDef = { key: 'scale', label: 'Scale', type: 'slider', min: 0.1, max: 4, step: 0.05, default: 1 };
 const offXDef: ControlDef = { key: 'offsetX', label: 'Offset X', type: 'slider', min: -2, max: 2, step: 0.02, default: 0 };
@@ -19,7 +20,8 @@ const offZDef: ControlDef = { key: 'offsetZ', label: 'Position Z', type: 'slider
 // sliders and the pad would now be a third and fourth way to set the same
 // numbers.
 
-export default function ModelControl() {
+export default function ModelControl({ sectionId }: { sectionId?: string } = {}) {
+  const [open, toggle] = useSection(sectionId);
   const effectId = use3DStore((s) => s.effectId);
   const model = use3DStore((s) => s.models[s.effectId] ?? defaultModelFor(s.effectId));
   const setModelScale = use3DStore((s) => s.setModelScale);
@@ -43,8 +45,8 @@ export default function ModelControl() {
 
   return (
     <>
-      <div className="section-head"><span className="eyebrow">Model Control</span></div>
-      <div className="section-body mc-body">
+      <SectionHead title="Model Control" open={open} onToggle={toggle} />
+      {open && <div className="section-body mc-body">
         <button className="btn full" onClick={() => centerModel()}>Center model</button>
 
         <ControlRow def={scaleDef} value={model.scale} onChange={(v) => setModelScale(v)} />
@@ -93,7 +95,7 @@ export default function ModelControl() {
             )}
           </>
         )}
-      </div>
+      </div>}
     </>
   );
 }

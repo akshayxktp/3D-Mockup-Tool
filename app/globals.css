@@ -24,7 +24,7 @@ body {
 body {
   background: var(--stage);
   color: var(--fg-body);
-  font-family: var(--font-inter), 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  font-family: var(--font-geist), 'Geist', system-ui, -apple-system, 'Segoe UI', sans-serif;
   font-size: var(--fs-ui);
   line-height: var(--lh-ui);
   -webkit-font-smoothing: antialiased;
@@ -130,6 +130,17 @@ input[type=range] {
   --templates-col: 0px;
 }
 
+/* One inspector column instead of two (Mockup). The stage takes back the width
+   the second column was using, and the single column keeps the standard panel
+   width — widening it would just trade a crowded panel for a crowded wider one. */
+.app-single-panel {
+  --controls-col: 0px;
+}
+
+.app-single-panel > .controls {
+  display: none;
+}
+
 .app.right-collapsed {
   --controls-col: 0px;
   --right-col: 0px;
@@ -183,6 +194,100 @@ input[type=range] {
   background: var(--card);
 }
 
+/* Foldable section header. The strip is the hit target, so the padding belongs
+   to the button rather than to the row — a header you can only fold by hitting
+   a 13px chevron is a header nobody folds. Full-bleed dividers between every
+   section: with the bodies gone, the rules ARE the structure. */
+.section-head-fold {
+  position: relative;
+  padding: 0;
+  gap: 0;
+  align-items: stretch;
+}
+
+.section-fold-btn {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 15px var(--pad-sect);
+  background: none;
+  border: 0;
+  cursor: pointer;
+  color: inherit;
+  text-align: left;
+}
+
+/* Weight and size carry the hierarchy, not colour: a muted 10px eyebrow reads
+   as a caption on something, and these headers are not captions — with every
+   body folded they are the entire panel. */
+.section-fold-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  color: var(--fg);
+}
+
+.section-fold-btn > svg {
+  flex: 0 0 auto;
+  color: var(--fg-muted);
+  transition: transform var(--t-fast, 120ms) ease;
+  transform: rotate(-90deg);
+}
+
+.section-head-fold.is-open .section-fold-btn > svg {
+  transform: rotate(0deg);
+}
+
+.section-fold-btn:hover .section-fold-title,
+.section-fold-btn:hover > svg {
+  color: var(--fg);
+}
+
+/* Badge and reset ride on top of the fold button rather than inside it — one
+   row, two actions, without nesting a button in a button. */
+.section-head-tail {
+  position: absolute;
+  right: calc(var(--pad-sect) + 21px);
+  top: 0;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.section-head-tail > * {
+  pointer-events: auto;
+}
+
+.section-reset {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-seg);
+  background: none;
+  color: var(--fg-muted);
+  cursor: pointer;
+}
+
+.section-reset:hover {
+  color: var(--fg);
+  background: var(--card-inset);
+}
+
+
 .section-body {
   padding: 9px var(--pad-sect) 18px;
   display: flex;
@@ -209,6 +314,18 @@ input[type=range] {
 .card-scroll > .section-head,
 .card-scroll > :first-child > .section-head {
   padding-top: 16px;
+}
+
+/* The fold header carries its padding on the button, so the rule above cannot
+   reach it — the first section would otherwise start hard against the top edge. */
+.card-scroll > .section-head-fold,
+.card-scroll > :first-child > .section-head-fold {
+  padding-top: 0;
+}
+
+.card-scroll > .section-head-fold:first-child .section-fold-btn,
+.card-scroll > :first-child > .section-head-fold:first-child .section-fold-btn {
+  padding-top: 18px;
 }
 
 .ctl-hint {
@@ -1195,6 +1312,40 @@ input[type=range] {
   gap: var(--gap-tight);
 }
 
+/* Label and control on ONE line. Stacking them cost a whole line per control,
+   and a panel with thirty controls in it was thirty lines taller than it needed
+   to be — which is what made these panels read as flooded. Controls that cannot
+   share a line (pads, dials, text fields, long pill rows) keep the stacked form;
+   see needsOwnLine() in Controls.tsx. */
+.ctl-row-inline {
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+  min-height: var(--ctl-h);
+}
+
+.ctl-row-inline > .ctl-label {
+  flex: 0 1 auto;
+  min-width: 0;
+  /* The label yields before the control does: a control squeezed under its
+     usable width is broken, whereas a truncated word is still readable, and the
+     row's title attribute carries the full text either way. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ctl-row-inline > .ctl-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  justify-content: flex-end;
+}
+
+/* A slider owns its whole row — its label is inside the track. */
+.ctl-row-bare > .ctl-input {
+  width: 100%;
+}
+
 .ctl-label {
   font-size: var(--fs-label);
   line-height: var(--lh-label);
@@ -1203,6 +1354,26 @@ input[type=range] {
 
 .ctl-input {
   display: flex;
+}
+
+/* The slider's own label, sitting in the track opposite the readout. Ends
+   before the readout starts so the two can never collide on a narrow panel;
+   the readout wins that space because a number nobody can read is useless
+   while a clipped label is still recognisable. */
+.slabel {
+  position: absolute;
+  left: 9px;
+  right: 52px;
+  top: 50%;
+  z-index: 1;
+  transform: translateY(-50%);
+  font-size: var(--fs-label);
+  line-height: var(--lh-label);
+  color: var(--sl-value, var(--fg-label));
+  pointer-events: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* slider — the whole 34px track IS the slider; value sits inside right.
@@ -5491,6 +5662,17 @@ select.field {
   border-top: 1px solid var(--line);
 }
 
+/* A group nested inside a section body inherits that body's inset, but one
+   sitting straight in the scroll column has nothing to inset it — and
+   `padding: 14px 0` above gives it none of its own. That is what put Blur,
+   Guides, Adjustments and Ground flush against the panel edge while every
+   heading above them, and every nested group, sat 14px in. Only the direct
+   children need it; the border stays on the element box, so the dividers
+   between groups stay full-bleed. */
+.card-scroll > .e3d-group {
+  padding-inline: var(--pad-sect, 14px);
+}
+
 .e3d-group:first-child {
   border-top: 0;
   padding-top: 4px;
@@ -5502,6 +5684,46 @@ select.field {
   letter-spacing: 1.5px;
   text-transform: uppercase;
   color: var(--fg-muted);
+}
+
+/* Foldable group title. Full width so the whole line folds the group, not just
+   the word — and the chevron carries the state, matching the section headers
+   one level up. */
+.e3d-group-fold {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 0;
+  background: none;
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--fs-eyebrow);
+  font-weight: 500;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  color: var(--fg-muted);
+  text-align: left;
+}
+
+.e3d-group-fold:hover {
+  color: var(--fg);
+}
+
+.e3d-group-fold svg {
+  flex: 0 0 auto;
+  transition: transform var(--t-fast, 120ms) ease;
+}
+
+.e3d-group.is-open .e3d-group-fold svg {
+  transform: rotate(90deg);
+}
+
+/* A folded group is one line: drop the padding it kept for controls that are
+   no longer there. */
+.e3d-group.is-foldable:not(.is-open) {
+  padding: 9px 0;
 }
 
 /* extra 3D post-processing overlays (see ThreeStage3D) */

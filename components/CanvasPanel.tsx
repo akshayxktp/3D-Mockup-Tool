@@ -7,6 +7,7 @@ import GradientEditor from './GradientEditor';
 import ColorPicker from './ColorPicker';
 import { normalizeGradientSpec } from '@/lib/gradient';
 import type { ControlDef } from '@/lib/types';
+import { SectionHead, useSection } from './PanelSection';
 
 const FPS_OPTIONS = [15, 25, 30, 60] as const;
 const BG_ALPHA: ControlDef = { key: 'background-alpha', label: 'Alpha', type: 'slider', min: 0, max: 100, step: 1, default: 100 };
@@ -49,7 +50,8 @@ export function DimInput({ value, onCommit, min = 16, max = 8192 }: {
 
 // `is3DMode` drops Safe area and the Background/Logo/Audio sections — 3D
 // and Mockup mode have their own BackgroundFill panel and no overlay concept.
-export default function CanvasPanel({ is3DMode = false }: { is3DMode?: boolean } = {}) {
+export default function CanvasPanel({ is3DMode = false, sectionId }: { is3DMode?: boolean; sectionId?: string } = {}) {
+  const [open, toggle] = useSection(sectionId);
   const aspect = useSceneStore((s) => s.aspect);
   const activeTemplateId = useSceneStore((s) => s.activeTemplateId);
   const setAspect = useSceneStore((s) => s.setAspect);
@@ -78,8 +80,8 @@ export default function CanvasPanel({ is3DMode = false }: { is3DMode?: boolean }
 
   return (
     <>
-      <div className="section-head"><span className="eyebrow">Canvas</span></div>
-      <div className="section-body">
+      <SectionHead title="Canvas" open={open} onToggle={toggle} />
+      {open && <div className="section-body">
         <div className="ctl-section">
           <div className="ctl-section-title">Dimensions</div>
           <div className="ctl-row">
@@ -234,7 +236,7 @@ export default function CanvasPanel({ is3DMode = false }: { is3DMode?: boolean }
             </div>
           </div>
         )}
-      </div>
+      </div>}
     </>
   );
 }
