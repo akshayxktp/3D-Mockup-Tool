@@ -16,7 +16,14 @@ feature was removed.
 |---|---|
 | `three3d/mockupControls.ts` | New controls: split Body/Glass Exposure, Light Softness, a Blur group (Blur, Focus Size, Falloff, Bokeh, Click to Focus, Focus X/Y) and a Guides group (3×3 / 6×6 grid). |
 | `three3d/mockup.ts` | Per-material exposure applied as a shader gain so the body and the front glass light separately; finish re-hue remapped around lightness so a finish lighter than the shipped one no longer clips to white; key-light shadow softness (shadow map switched to PCF so `shadow.radius` is honoured); optional transparent background for capture; a radial defocus post-processing pass with bokeh weighting and click-to-focus. |
-| `three3d/devices.ts` | Added iPhone 17 Pro finishes (Sky Blue, Plum, Black) and an iPhone Air Black finish. |
+| `three3d/devices.ts` | Added iPhone 17 Pro finishes (Sky Blue, Plum, Black) and an iPhone Air Black finish. New `watch` screen slot and an **Apple Watch Series 5** device (4 finishes), the first device on that slot. |
+| `public/3d/devices/applewatch-clean.glb` | **New asset.** Apple Watch Series 5 mesh, prepared from a CC-BY-4.0 Sketchfab model — see [NOTICE](NOTICE) for the credit and the statement of changes CC-BY requires. |
+| `scripts/_prep_device_glb.cjs` | **New file.** The one-shot preparation the watch mesh went through, kept so the asset is reproducible from its source rather than being an opaque binary. |
+| `public/3d/devices/applewatch-fabric.glb` | **New asset.** A second watch, converted from a supplied OBJ/MTL pair. Its provenance is unrecorded — see the TODO in [NOTICE](NOTICE) before redistributing. |
+| `scripts/_obj_to_device_glb.cjs` | **New file.** OBJ/MTL → GLB conversion for device meshes: infers PBR from the Blinn-Phong MTL, names the display panel `Screen`, and squares the model up so the panel faces +Z with no roll. |
+| `public/3d/devices/nothingphone3-clean.glb` | **New asset.** Nothing Phone (3). Provenance unrecorded — see [NOTICE](NOTICE). |
+| `public/3d/devices/nothingphone4apro-clean.glb` | **New asset.** Nothing Phone (4a) Pro, with a display quad added over its painted front plate. Provenance unrecorded — see [NOTICE](NOTICE). |
+| `scripts/_inset_screen_glb.cjs` | **New file.** Gives a display to a mesh whose whole front is one textured plate: leaves the plate (and so the rail, bezel and camera it paints) alone and lays a `Screen` quad over just the active display, measured in the plate texture's UV space. |
 | `three3d/ascii.ts` | Renderer-options type extended with `setTransparentBackground` and `onPickFocus`. |
 | `components/ExportDialog.tsx` | PNG image export at 1K–8K (long edge, multiples of 1024); a Backdrop/Transparent background option for the alpha-capable formats; the Adjustments grade is now replayed onto exported pixels. |
 | `components/ThreeStage3D.tsx` | Forwards the transparent-background and click-to-focus hooks, draws the composition-grid overlay, and builds its canvas grade through the shared helper. |

@@ -11,13 +11,14 @@ export interface DeviceFinish { key: string; label: string; hex: string; }
 // Which screen an uploaded asset belongs to. Assets are held PER SLOT, not per
 // device, so one phone screenshot serves every phone and switching device keeps
 // the right artwork on screen — the same model the reference tool uses.
-export type ScreenSlot = 'phone' | 'laptop' | 'tablet' | 'display';
+export type ScreenSlot = 'phone' | 'laptop' | 'tablet' | 'display' | 'watch';
 
 export const SLOT_LABELS: Record<ScreenSlot, string> = {
   phone: 'Phone screen',
   laptop: 'Laptop screen',
   tablet: 'Tablet screen',
   display: 'Display screen',
+  watch: 'Watch face',
 };
 
 export interface DeviceDef {
@@ -70,6 +71,43 @@ export const DEVICES: DeviceDef[] = [
     ],
   },
   {
+    // The mesh is authored at real scale (its 16.06 units are the phone's
+    // 160.6 mm), and `fitHeight` keeps that: 2.23 is 160.6 mm at the same
+    // 72 mm-per-world-unit the iPhone 17 Pro's 2.077 sets for 149.6 mm, so the
+    // two phones stand in correct proportion to each other on the stage.
+    key: 'nothingphone3', label: 'Nothing Phone (3)', modelUrl: '/3d/devices/nothingphone3-clean.glb', fitHeight: 2.23,
+    screenAspect: 0.456, screenCornerFrac: 0.098, slot: 'phone', screenPx: [1260, 2800],
+    // White first: it is the finish this mesh was authored in (the source file
+    // is named for it), and markEnclosureMaterials() reads finishes[0] as
+    // exactly that. It is also already a true neutral, which is what keeps the
+    // unsaturated match path — the only one that can find a white body — live.
+    finishes: [
+      { key: 'white', label: 'White', hex: '#f2f2f2' },
+      { key: 'black', label: 'Black', hex: '#1d1d1f' },
+    ],
+  },
+  {
+    // The source file ships the phone TWICE — a second copy turned 180 degrees
+    // so a product still can show front and back together. A device mesh has
+    // to be one device, so scripts/_prep_device_glb.cjs drops the reversed
+    // copy (`phone.001`) from the scene; without that, fitAndCenter would
+    // frame the pair and the phone would sit off to one side.
+    key: 'nothingphone4apro', label: 'Nothing Phone (4a) Pro', modelUrl: '/3d/devices/nothingphone4apro-clean.glb', fitHeight: 2.27,
+    // This mesh has no display geometry at all: its whole front is ONE quad
+    // whose texture paints the rail, the bezel, the punch-hole camera and a
+    // wallpaper together. Pointed at that plate, the app's artwork covered the
+    // entire face and took the bezel and camera with it. So the plate stays as
+    // authored and scripts/_inset_screen_glb.cjs lays a separate quad over
+    // just the active display, measured off that texture — the numbers below
+    // are that quad's, and its 0.451 is a real phone ratio where the plate's
+    // was 0.474.
+    screenAspect: 0.451, screenCornerFrac: 0.098, slot: 'phone', screenPx: [1080, 2400],
+    finishes: [
+      { key: 'white', label: 'White', hex: '#f2f2f2' },
+      { key: 'black', label: 'Black', hex: '#1d1d1f' },
+    ],
+  },
+  {
     key: 'macbook14', label: 'MacBook Pro 14"', modelUrl: '/3d/devices/macbook14-clean.glb', fitHeight: 1.3,
     screenAspect: 1.538, screenCornerFrac: 0.0086, screenTextureFlipY: false, slot: 'laptop', screenPx: [3024, 1964],
     finishes: [
@@ -105,6 +143,49 @@ export const DEVICES: DeviceDef[] = [
     key: 'studiodisplay', label: 'Studio Display', modelUrl: '/3d/devices/studiodisplay.glb', fitHeight: 1.5,
     screenAspect: 1.78, screenCornerFrac: 0.012, screenTextureFlipY: false, slot: 'display', screenPx: [5120, 2880],
     finishes: [{ key: 'silver', label: 'Silver', hex: '#d8d8da' }],
+  },
+  {
+    key: 'applewatch', label: 'Apple Watch Series 5', modelUrl: '/3d/devices/applewatch-clean.glb', fitHeight: 1.9,
+    screenAspect: 0.821, screenCornerFrac: 0.185, slot: 'watch', screenPx: [368, 448],
+    // Silver stays first for the same reason Cosmic Orange does on the 17 Pro:
+    // markEnclosureMaterials() reads finishes[0] as the colour the case was
+    // authored in. It must also stay a TRUE neutral: that function only takes
+    // the unsaturated match path when the shipped hex's own saturation is
+    // below 0.1, and the case's authored aluminium (linear .9405/.9437/.95) is
+    // faintly blue — spelling it as #f8f9fa reads as s 0.16, sends the match
+    // down the hue path instead, and the Finish control then repaints nothing.
+    finishes: [
+      { key: 'silver', label: 'Silver', hex: '#f9f9f9' },
+      { key: 'spacegray', label: 'Space Gray', hex: '#57534e' },
+      { key: 'gold', label: 'Gold', hex: '#e8cbb8' },
+      { key: 'spaceblack', label: 'Space Black', hex: '#3b3b3d' },
+    ],
+  },
+  {
+    // Converted from an OBJ/MTL pair by scripts/_obj_to_device_glb.cjs, so it
+    // carries none of the PBR the other meshes are authored with — the
+    // metalness and roughness here are inferred from the MTL's Blinn-Phong
+    // exponent, not read, and it grades flatter under the studio rig as a
+    // result. The panel is a stylised one rather than a measured one: 0.836
+    // with corners at 29% of the short side, against the real Series 5's 0.821
+    // and ~18%. `screenPx` states THIS mesh's own ratio rather than Apple's
+    // published one, since the number's whole job in the UI is to say what
+    // size to prepare artwork at.
+    key: 'applewatchfabric', label: 'Apple Watch (fabric band)', modelUrl: '/3d/devices/applewatch-fabric.glb', fitHeight: 1.9,
+    screenAspect: 0.836, screenCornerFrac: 0.29, slot: 'watch', screenPx: [368, 440],
+    // Same rule as the Series 5 above, and this mesh is the strict case for it.
+    // Its `watch_metal` is a warm grey (linear .521/.495/.420) whose own
+    // saturation is .107 — under MIN_SAT — so the hue path can never match it,
+    // and the neutral path only runs when finishes[0] is itself below s .1.
+    // Titanium is therefore spelled as a true grey at that metal's lightness:
+    // it is the authored colour, and the only entry that makes the other three
+    // reachable at all.
+    finishes: [
+      { key: 'titanium', label: 'Titanium', hex: '#b6b6b6' },
+      { key: 'silver', label: 'Silver', hex: '#dcdcdc' },
+      { key: 'graphite', label: 'Graphite', hex: '#6f6f6f' },
+      { key: 'spaceblack', label: 'Space Black', hex: '#3f3f3f' },
+    ],
   },
 ];
 
