@@ -29,10 +29,17 @@ export const mockupGroups: ControlGroup[] = [
     title: 'Screen',
     controls: [
       { key: 'screenBrightness', label: 'Brightness', type: 'slider', min: 0, max: 1.6, step: 0.05, default: 1 },
-      // How much of the studio environment the cover glass mirrors back. 0 by
-      // default: the room map bakes in rectangular panels, and a mirror-smooth
-      // display returns one as a hard softbox — the CG tell the reference
-      // tool's screens don't have. Raise it for a deliberate glossy look.
+      // How much of the studio environment the cover glass mirrors back.
+      // This shipped at 0 because the old RoomEnvironment map was a lit box on
+      // every side, so a mirror-smooth display returned one of its rectangular
+      // panels as a hard softbox. three3d/studioEnv.ts replaced that with a
+      // dark surround and a few placed cards, so the reflection a screen picks
+      // up now is a soft graded falloff rather than a pasted rectangle, and
+      // this slider is usable across its whole range.
+      //
+      // It stays at 0 by default all the same, for a different reason: the
+      // point of the stage is to show the artwork someone uploaded, and glare
+      // costs legibility. Raise it when the glass matters more than the UI.
       { key: 'screenGlare', label: 'Glare', type: 'slider', min: 0, max: 100, step: 1, default: 0 },
     ],
   },

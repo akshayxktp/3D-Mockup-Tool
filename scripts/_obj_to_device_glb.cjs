@@ -42,9 +42,30 @@ const mtl = new Map();
     // the authoring machine and the image does not travel with the pair.
   }
 }
+// Ns -> roughness. NOT the textbook Blinn-Phong inverse sqrt(2/(Ns+2)): a
+// Blender OBJ export does not write a Blinn-Phong exponent, it writes
+//
+//     Ns = 1000 * (1 - roughness)^2
+//
+// which the file proves on its own — several materials sit at exactly Ns 250,
+// and 1000*(1-0.5)^2 = 250 is Blender's Principled default roughness of 0.5.
+// Read as a Blinn-Phong exponent that same 250 comes out at 0.09, so every
+// surface in the model lands near-mirror: it is what made a matte textile band
+// (real roughness 0.73) render as wet-look rubber at 0.17.
+// Per-material roughness overrides, "name=value,name=value". Classic MTL has
+// no metalness or roughness of its own, so both are inferred here — and where
+// the inferred value is simply wrong for the real surface (a bead-blasted
+// titanium case reading as polished chrome), this is the way to say so.
+// Unlike the Ns mapping above, an entry here is a deliberate override of what
+// the file states, not a correction of how it was read.
+const ROUGH_OVERRIDE = new Map(
+  (process.argv[6] ?? '').split(',').map((x) => x.trim()).filter(Boolean)
+    .map((x) => { const [k, v] = x.split('='); return [k, Number(v)]; }));
+
 const pbrOf = (name) => {
   const m = mtl.get(name) || { kd: [0.8, 0.8, 0.8], ns: 250, illum: 2, d: 1 };
-  const rough = Math.min(1, Math.max(0.04, Math.sqrt(2 / (m.ns + 2))));
+  let rough = Math.min(1, Math.max(0.03, 1 - Math.sqrt(Math.min(1000, Math.max(0, m.ns)) / 1000)));
+  if (ROUGH_OVERRIDE.has(name)) rough = ROUGH_OVERRIDE.get(name);
   return { kd: m.kd, rough, metal: m.illum >= 3 ? 1 : 0, alpha: m.d };
 };
 

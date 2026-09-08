@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
+import { studioEnvironment } from './studioEnv';
 import type { AsciiOptions } from './ascii';
 import { isOn } from './asciiControls';
 import { fitAndCenter } from './frame';
@@ -411,7 +411,7 @@ export function initMockup(
 
   // Room-environment map → soft, believable reflections without a real HDRI.
   const pmrem = new THREE.PMREMGenerator(renderer);
-  const envRT = pmrem.fromScene(new RoomEnvironment(), 0.04);
+  const envRT = pmrem.fromScene(studioEnvironment(), 0.04);
   scene.environment = envRT.texture;
   (scene as any).environmentIntensity = 1.6;
 
@@ -1035,7 +1035,18 @@ export function initMockup(
       // laid over the display rather than some unrelated panel elsewhere.
       const ratio = area(size) / sArea;
       const offset = c.distanceTo(sCenter);
-      if (ratio > 0.8 && ratio < 1.25 && offset < Math.max(sSize.x, sSize.y) * 0.12) {
+      // ...and IN FRONT of it. A device's back panel has the same face and the
+      // same centre in x/y as its screen, and only the depth tells them apart,
+      // so a plain distance test claims the back as cover glass. That mistake
+      // is invisible on an opaque back and glaring on a transparent one: the
+      // per-frame walk drives cover glass at `envIntensity * screenGlare`, and
+      // Glare ships at 0, so the Nothing Phone's back glass was having its
+      // reflections multiplied by zero and rendered dead matte from every
+      // angle. Devices are prepared with the screen facing +Z, so the cover
+      // glass sits at or slightly above the screen's own z; the back sits a
+      // whole device-thickness below it.
+      const inFront = c.z >= sCenter.z - Math.max(1e-6, sSize.z) - modelHalf * 0.06;
+      if (ratio > 0.8 && ratio < 1.25 && offset < Math.max(sSize.x, sSize.y) * 0.12 && inFront) {
         mat.userData.isScreenGlass = true;
       }
     }
@@ -1202,6 +1213,34 @@ export function initMockup(
     }
   }
 
+  // Which materials a device's Finish repaints, named outright.
+  //
+  // markEnclosureMaterials() finds a body by looking for one large, evenly
+  // coloured panel, which is what a unibody phone or tablet is. The Nothing
+  // Phone is not that: its back is a transparent-look assembly of dozens of
+  // small textured plates, and not one of them clears the panel-size gate, so
+  // the scan marked nothing and the Finish control did nothing at all.
+  //
+  // This mesh does name its materials, though, so for it the body can simply be
+  // stated. Only the parts that actually change colour between the white and
+  // black variants are listed: the plates and the frame. The camera rings, the
+  // Glyph matrix, the lenses and the screws are black on both, and naming them
+  // here would wash them out the moment a light finish was picked.
+  const ENCLOSURE_BY_MATERIAL: Record<string, string[]> = {
+    nothingphone3: ['back panel', 'back panel.001', 'frame', 'frame.001', 'logo.001', 'logo.002'],
+  };
+
+  function markEnclosureByMaterialName() {
+    const names = DEV ? ENCLOSURE_BY_MATERIAL[DEV.key] : undefined;
+    if (!names) return;
+    let hit = 0;
+    for (const m of materials as any[]) {
+      if (m.userData.partKey === 'Screen') continue;
+      if (names.includes(m.userData.partKey as string)) { m.userData.isEnclosure = true; hit++; }
+    }
+    if (!hit) console.warn(`[mockup] no material matched the enclosure list for ${DEV?.key}`);
+  }
+
   function markIPhoneAirRearPanelAsEnclosure() {
     if (DEV?.key !== 'iphoneair') return;
     for (let i = 0; i < meshList.length; i++) {
@@ -1234,8 +1273,25 @@ export function initMockup(
   // Keyed by material name: machine-generated, but stable inside these
   // committed assets. A name that no longer resolves is a silent no-op, so a
   // re-exported mesh degrades to today's appearance instead of throwing.
-  const MATTE_PANEL_FIXUPS: Record<string, Array<{ panel: string; copyFrom?: string }>> = {
+  const MATTE_PANEL_FIXUPS: Record<string, Array<{
+    panel: string; copyFrom?: string;
+    metalness?: number; roughness?: number; opacity?: number;
+  }>> = {
     ipadpro:   [{ panel: 'WHeurdvnNmzlaVj', copyFrom: 'AQYGetoGtanvwug' }],
+    // The Nothing Phone's back glass is authored metalness 1 / opacity 0.2.
+    // Three blends a transparent material by scaling EVERYTHING it outputs,
+    // specular included, so four fifths of its reflection was being thrown
+    // away — which is why the back read as dead matte from every angle while
+    // the camera rings, which are opaque, caught light normally.
+    //
+    // A cover glass is a dielectric, not a metal, so metalness drops to 0 and
+    // roughness to a polished 0.05. Opacity rises only as far as 0.45: the
+    // whole point of this device is the components showing through, and an
+    // opaque back would hide them.
+    nothingphone3: [
+      { panel: 'glass',     metalness: 0, roughness: 0.05, opacity: 0.45 },
+      { panel: 'glass.001', metalness: 0, roughness: 0.05, opacity: 0.45 },
+    ],
   };
 
   function repairMattePanels() {
@@ -1251,9 +1307,18 @@ export function initMockup(
         target.metalness = source.metalness;
         target.roughness = source.roughness;
       }
+      // Explicit values, for a panel with no correctly-authored sibling to copy.
+      const fx = fixes.find((f) => f.panel === panel)!;
+      if (fx.metalness !== undefined) target.metalness = fx.metalness;
+      if (fx.roughness !== undefined) target.roughness = fx.roughness;
+      if (fx.opacity !== undefined) {
+        target.opacity = fx.opacity;
+        target.transparent = fx.opacity < 1;
+      }
       // The micro-roughness noise multiplies against this baseline, so it has
       // to move with the roughness or the panel keeps the old surface response.
       if (source) target.userData.origRoughness = source.roughness;
+      if (fx.roughness !== undefined) target.userData.origRoughness = fx.roughness;
       target.needsUpdate = true;
     }
   }
@@ -1403,6 +1468,7 @@ export function initMockup(
       });
       repairMattePanels();
       markEnclosureMaterials();
+      markEnclosureByMaterialName();
       markIPhoneAirRearPanelAsEnclosure();
       modelHalf = fitAndCenter(model, MODEL_SIZE);
       const box = new THREE.Box3().setFromObject(model);

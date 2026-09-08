@@ -77,13 +77,23 @@ export const DEVICES: DeviceDef[] = [
     // two phones stand in correct proportion to each other on the stage.
     key: 'nothingphone3', label: 'Nothing Phone (3)', modelUrl: '/3d/devices/nothingphone3-clean.glb', fitHeight: 2.23,
     screenAspect: 0.456, screenCornerFrac: 0.098, slot: 'phone', screenPx: [1260, 2800],
-    // White first: it is the finish this mesh was authored in (the source file
-    // is named for it), and markEnclosureMaterials() reads finishes[0] as
-    // exactly that. It is also already a true neutral, which is what keeps the
-    // unsaturated match path — the only one that can find a white body — live.
+    // White only, and deliberately.
+    //
+    // This mesh carries exactly one back texture, the white variant's, and
+    // everything that makes the back read — the plate tones, the silkscreen,
+    // the red accent square — lives in that image rather than in geometry or
+    // material colour. The Finish control works by re-hueing material colour,
+    // which multiplies the map: going to black drives the whole texture to
+    // black and takes the red square and the plate edges with it. The real
+    // black Phone (3) is not the white one tinted, it ships a different back
+    // texture altogether.
+    //
+    // A Black swatch here can therefore look wrong but never right, so it is
+    // not offered. Add one when a black-variant texture is available; the
+    // ENCLOSURE_BY_MATERIAL entry in three3d/mockup.ts already resolves this
+    // device's body correctly and is what such a variant would build on.
     finishes: [
       { key: 'white', label: 'White', hex: '#f2f2f2' },
-      { key: 'black', label: 'Black', hex: '#1d1d1f' },
     ],
   },
   {
