@@ -1,6 +1,6 @@
 'use client';
 
-import { useRef } from 'react';
+import { useRef, useState } from 'react';
 import { use3DStore, defaultModelFor } from '@/store/use3DStore';
 import { findDevice, SLOT_LABELS } from '@/three3d/devices';
 import { ControlRow } from './Controls';
@@ -51,11 +51,21 @@ export default function ScreenContent({ sectionId }: { sectionId?: string } = {}
   const fileRef = useRef<HTMLInputElement>(null);
 
   const device = findDevice(modelUrl);
+  // Hook order has to stay stable, so this sits above the early return.
+  const [pickedSlot, setPickedSlot] = useState<string | null>(null);
   if (!device) return null;
 
-  const slot = device.slot;
+  // A device can carry more than one panel (the foldable Duo: inner display +
+  // outer cover). The primary is always first — it is the one that accepts
+  // video and the status-bar overlay.
+  const panels = [
+    { slot: device.slot, screenPx: device.screenPx, primary: true },
+    ...(device.extraScreens ?? []).map((e) => ({ slot: e.slot, screenPx: e.screenPx, primary: false })),
+  ];
+  const active = panels.find((p) => p.slot === pickedSlot) ?? panels[0];
+  const slot = active.slot;
   const media = screenMediaBySlot[slot] ?? null;
-  const [pxW, pxH] = device.screenPx;
+  const [pxW, pxH] = active.screenPx;
 
   const onFile = (f: File | undefined) => {
     if (!f) return;
@@ -76,12 +86,35 @@ export default function ScreenContent({ sectionId }: { sectionId?: string } = {}
         onToggle={toggle}
       />
       {open && <div className="section-body mc-body">
-        <div className="ctl-hint">{SLOT_LABELS[slot]} — shared by every {slot} device.</div>
+        {panels.length > 1 && (
+          <div className="ctl-row">
+            <label className="ctl-label">Screen</label>
+            <div className="pills">
+              {panels.map((p) => (
+                <button
+                  key={p.slot}
+                  className={`pill ${slot === p.slot ? 'active' : ''}`}
+                  onClick={() => setPickedSlot(p.slot)}
+                >
+                  {SLOT_LABELS[p.slot]}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+        <div className="ctl-hint">
+          {SLOT_LABELS[slot]}
+          {panels.length > 1
+            ? active.primary
+              ? ' — image or video. Open the fold to see it.'
+              : ' — still image only. Close the fold to see it.'
+            : ` — shared by every ${slot} device.`}
+        </div>
 
         <input
           ref={fileRef}
           type="file"
-          accept="image/*,video/*"
+          accept={active.primary ? 'image/*,video/*' : 'image/*'}
           style={{ display: 'none' }}
           onChange={(e) => onFile(e.target.files?.[0])}
         />
@@ -98,7 +131,11 @@ export default function ScreenContent({ sectionId }: { sectionId?: string } = {}
           <button className="btn full" onClick={() => fileRef.current?.click()}>Upload image or video…</button>
         )}
 
-        {media && (
+        {media && !active.primary && (
+          <button className="btn full" onClick={() => fileRef.current?.click()}>Replace image…</button>
+        )}
+
+        {media && active.primary && (
           <>
             <button className="btn full" onClick={() => fileRef.current?.click()}>Replace {media.kind}…</button>
             <div className="ctl-row">

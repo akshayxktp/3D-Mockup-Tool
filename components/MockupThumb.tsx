@@ -81,7 +81,7 @@ function loadGLB(url: string): Promise<THREE.Group> {
   if (cached) return Promise.resolve(cached);
   const loading = glbLoading.get(resolvedUrl);
   if (loading) return loading;
-  const p = loadGLBSource(resolvedUrl).then((source) => {
+  const p = loadGLBSource(resolvedUrl).then(({ scene: source }) => {
     const model = source.clone(true);
     glbCache.set(resolvedUrl, model);
     glbLoading.delete(resolvedUrl);

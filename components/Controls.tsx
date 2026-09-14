@@ -390,8 +390,12 @@ export function controlVisible(def: ControlDef, values: Record<string, any>): bo
   const rule = def.visibleWhen;
   if (!rule) return true;
   const current = values[rule.key];
-  if (rule.equals !== undefined && current !== rule.equals) return false;
-  if (rule.not !== undefined && current === rule.not) return false;
+  // An ARRAY means "any of these" — a control that belongs to several modes
+  // (the Blur panel's Focus Size, shown for Radial, Tilt Shift and Lens) would
+  // otherwise need one rule per mode, which the single-rule shape cannot hold.
+  const hit = (want: any) => (Array.isArray(want) ? want.includes(current) : current === want);
+  if (rule.equals !== undefined && !hit(rule.equals)) return false;
+  if (rule.not !== undefined && hit(rule.not)) return false;
   return true;
 }
 
