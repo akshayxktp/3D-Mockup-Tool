@@ -47,6 +47,10 @@ export interface AsciiOptions {
   onCamera?: (rig: CameraRig | null) => void;
   // Mockup mode — image/video composited onto the device's "Screen" mesh.
   getScreenMedia?: () => { kind: 'image' | 'video'; url: string } | null;
+  // Media for a NAMED slot — used by devices with more than one panel (the
+  // foldable Duo's cover display alongside its inner one). getScreenMedia above
+  // stays the primary panel's, so every single-screen device is unaffected.
+  getScreenMediaForSlot?: (slot: string) => { kind: 'image' | 'video'; url: string } | null;
   // How that media is laid into the screen (fit mode, zoom, 0..100 anchor).
   getScreenTransform?: () => { fit: 'cover' | 'width' | 'contain'; zoom: number; offsetX: number; offsetY: number };
   getScreenStatus?: () => {

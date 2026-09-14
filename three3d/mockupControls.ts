@@ -10,6 +10,12 @@ export const mockupGroups: ControlGroup[] = [
     controls: [
       { key: 'fieldOfView', label: 'Field of View', type: 'slider', min: 15, max: 90, step: 1, default: 42, unit: '°' },
       { key: 'lidAngle', label: 'Laptop Lid', type: 'slider', min: 3, max: 115, step: 1, default: 112, unit: '°' },
+      // iPhone Duo book fold, scrubbing the device's own rigged animation
+      // clip rather than a hand-authored hinge angle — see
+      // DeviceDef.foldAnimationClip in three3d/devices.ts. 100 = open flat,
+      // 0 = closed. Like Laptop Lid above, inert on devices with no matching
+      // clip, so it can live in the shared schema.
+      { key: 'foldAngle', label: 'Duo Fold', type: 'slider', min: 0, max: 100, step: 1, default: 100, unit: '%' },
     ],
   },
   {
@@ -116,6 +122,11 @@ export const mockupGroups: ControlGroup[] = [
       // Where that click landed, in viewport UV. Centre until something moves it.
       { key: 'blurFocusX', label: 'Focus X', type: 'slider', min: 0, max: 1, step: 0.01, default: 0.5 },
       { key: 'blurFocusY', label: 'Focus Y', type: 'slider', min: 0, max: 1, step: 0.01, default: 0.5 },
+      // Which axes the focus falloff measures along. Both On = the radial focus.
+      // Turn one off to keep a straight in-focus band across the axis left on
+      // (X only = vertical band, Y only = horizontal band) — a tilt-shift look.
+      { key: 'blurAxisX', label: 'Focus X Axis', type: 'toggle', options: ['On', 'Off'], default: 'On' },
+      { key: 'blurAxisY', label: 'Focus Y Axis', type: 'toggle', options: ['On', 'Off'], default: 'On' },
     ],
   },
   {

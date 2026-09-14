@@ -80,6 +80,7 @@ export default function ThreeStage3D({ effectId: forcedEffectId }: { effectId?: 
         const slot = findDevice((s.models[effectId] ?? defaultModelFor(effectId)).url)?.slot;
         return slot ? (s.screenMedia[slot] ?? null) : null;
       },
+      getScreenMediaForSlot: (slot: string) => use3DStore.getState().screenMedia[slot] ?? null,
       getScreenTransform: () => {
         const s = use3DStore.getState();
         return { fit: s.screenFit, zoom: s.screenZoom, offsetX: s.screenOffsetX, offsetY: s.screenOffsetY };
