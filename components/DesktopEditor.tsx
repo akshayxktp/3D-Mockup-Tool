@@ -61,7 +61,7 @@ export default function DesktopEditor() {
   }, [isMockup, is3D]);
 
   return (
-    <div className={`app ${isWeb || isBoard ? 'app-web' : ''} ${isProjects ? 'app-projects' : ''} ${tplCollapsed ? 'app-tpl-collapsed' : ''} ${leftCollapsed ? 'left-collapsed' : ''} ${rightCollapsed ? 'right-collapsed' : ''}`}>
+    <div className={`app ${isWeb || isBoard ? 'app-web' : ''} ${isMockup ? 'app-single-panel' : ''} ${isProjects ? 'app-projects' : ''} ${tplCollapsed ? 'app-tpl-collapsed' : ''} ${leftCollapsed ? 'left-collapsed' : ''} ${rightCollapsed ? 'right-collapsed' : ''}`}>
       <IconRail />
 
       {/* Projects is a tab of its own: it takes the middle of the screen (see
@@ -72,7 +72,7 @@ export default function DesktopEditor() {
           Pixi/Three canvases survive a section change. */}
       {isProjects ? null : tplCollapsed ? <CollapsedStrip /> : is3D ? <Effects3DPanel /> : isMockup ? <MockupPanel /> : <TemplatesCard controlsInline={isBoard} />}
 
-      {!isWeb && !isBoard && !isProjects && (
+      {!isWeb && !isBoard && !isProjects && !isMockup && (
         <section className="card controls card-scroll">
           {is3D || isMockup ? (
             <>
@@ -122,7 +122,19 @@ export default function DesktopEditor() {
         ) : is3D ? (
           <><CanvasPanel is3DMode /><div className="hairline" /><BackgroundFill /></>
         ) : isMockup ? (
-          <><CanvasPanel is3DMode /><div className="hairline" /><BackgroundFill hideTexture /></>
+          <>
+            <ScreenContent />
+            <div className="hairline" />
+            <ModelControl />
+            <div className="hairline" />
+            <ModelColors />
+            <div className="hairline" />
+            <Effect3DControls effectId="mockup" />
+            <div className="hairline" />
+            <CanvasPanel is3DMode />
+            <div className="hairline" />
+            <BackgroundFill hideTexture />
+          </>
         ) : (
           <><CanvasPanel /><div className="hairline" /><AssetsPanel /></>
         )}

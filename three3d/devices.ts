@@ -96,6 +96,11 @@ export interface DeviceDef {
 
 export const DEVICES: DeviceDef[] = [
   {
+    key: 'applehomeview', label: 'Apple HomeView', modelUrl: '/3d/devices/apple-homeview.usdz', fitHeight: 1.8,
+    screenAspect: 1.778, screenCornerFrac: 0.035, slot: 'display', screenPx: [3840, 2160],
+    finishes: [{ key: 'silver', label: 'Silver', hex: '#d8d8da' }],
+  },
+  {
     key: 'iphone17pro', label: 'iPhone 17 Pro', modelUrl: '/3d/devices/iphone17pro-clean.glb', fitHeight: 2.077,
     screenAspect: 0.462, screenCornerFrac: 0.151, slot: 'phone', screenPx: [1206, 2622],
     // Cosmic Orange stays first: markEnclosureMaterials() in three3d/mockup.ts
