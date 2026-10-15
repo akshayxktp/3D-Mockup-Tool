@@ -1,17 +1,18 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
+import { studioEnvironment } from './studioEnv';
 import type { AsciiOptions } from './ascii';
 import { isOn } from './asciiControls';
 import { fitAndCenter } from './frame';
 import { asset } from '@/lib/paths';
 import { makeCameraRig } from './cameraRig';
-import { findDevice } from './devices';
+import { findDevice, type ExtraScreenDef } from './devices';
 import { use3DStore } from '../store/use3DStore';
 import { useSceneStore } from '../store/useSceneStore';
 import { apply3DAnimation } from './animations';
 import { createCardVideo, seekVideoToTime } from '@/lib/videoTexture';
 import { loadGLBSource } from './gltfCache';
+import { clone as cloneSkinned } from 'three/examples/jsm/utils/SkeletonUtils.js';
 import {
   advancedRasterSize,
   gradientFromFill,
@@ -170,6 +171,12 @@ export function initMockup(
       uBokeh: { value: 0 },
       uPxHeight: { value: 1080 },
       uCentre: { value: new THREE.Vector2(0.5, 0.5) },
+      // Which axes the focus falloff measures distance along: 1 = active,
+      // 0 = ignored. Both active is the radial focus; disabling one leaves a
+      // straight in-focus band across the other (X only = a vertical band,
+      // Y only = a horizontal band).
+      uAxisX: { value: 1 },
+      uAxisY: { value: 1 },
       uShape: { value: 0 },        // aperture preset, see BOKEH_SHAPES
       uCA: { value: 0 },           // lateral chromatic aberration, in UV per unit radius
       uCAMode: { value: 0 },       // 0 none · 1 radial · 2 fringe · 3 horizontal
@@ -184,6 +191,7 @@ export function initMockup(
       uniform sampler2D tDiffuse;
       uniform float uStrength, uFocus, uFalloff, uAspect, uBokeh, uPxHeight;
       uniform float uShape, uCA, uCAMode, uMotion, uMotionAngle;
+      uniform float uAxisX, uAxisY;
       uniform vec2 uCentre;
       varying vec2 vUv;
       const int SAMPLES = 32;
@@ -225,6 +233,10 @@ export function initMockup(
         // circle on a non-square canvas rather than an ellipse.
         vec2 c = vUv - uCentre;
         c.x *= uAspect;
+        // Gate each axis: a disabled axis contributes no distance, so the focus
+        // falloff becomes a straight band across the axis that stays enabled.
+        c.x *= uAxisX;
+        c.y *= uAxisY;
         float d = length(c) * 2.0;
         float mask = smoothstep(uFocus, uFocus + max(uFalloff, 0.001), d);
         float radius = uStrength * mask;
@@ -411,7 +423,7 @@ export function initMockup(
 
   // Room-environment map → soft, believable reflections without a real HDRI.
   const pmrem = new THREE.PMREMGenerator(renderer);
-  const envRT = pmrem.fromScene(new RoomEnvironment(), 0.04);
+  const envRT = pmrem.fromScene(studioEnvironment(), 0.04);
   scene.environment = envRT.texture;
   (scene as any).environmentIntensity = 1.6;
 
@@ -755,7 +767,17 @@ export function initMockup(
   // gobo above) rather than a UV/shader mask: an earlier shader-based corner
   // mask relied on the mesh's raw `vUv` varying, which didn't hold for these
   // GLBs and discarded every fragment. Canvas clipping has no such dependency.
-  let screenMesh: THREE.Mesh | null = null;
+  // The primary panel's meshes. One for most devices; a list so a future
+  // device whose panel is split across multiple quads sharing a texture works
+  // the same way.
+  let screenMeshes: THREE.Mesh[] = [];
+  const PRIMARY_SCREEN_MAT = DEV?.screenMaterial ?? 'Screen';
+  // Driven by the Duo Fold slider on a rigged device — see the load callback
+  // below, which finds the clip and pauses it so `foldAction.time` scrubs a
+  // pose instead of playing back on a clock.
+  let foldMixer: THREE.AnimationMixer | null = null;
+  let foldAction: THREE.AnimationAction | null = null;
+  let foldClipDuration = 0;
   let screenKey = '';
   let screenVideoEl: HTMLVideoElement | null = null;
   let screenImageEl: HTMLImageElement | null = null;
@@ -784,6 +806,8 @@ export function initMockup(
   // in the panel's own (visual) orientation; only this allocation and the
   // transform in beginScreenSpace know about the swap.
   const SCREEN_TRANSPOSE = DEV?.screenTextureTranspose ?? null;
+  const SCREEN_ROTATE180 = DEV?.screenTextureRotate180 ?? false;
+  const SCREEN_FLIP_X = DEV?.screenTextureFlipX ?? false;
 
   function ensureScreenCanvas(screenAspect: number) {
     const aspect = SCREEN_TRANSPOSE ? 1 / screenAspect : screenAspect;
@@ -802,7 +826,18 @@ export function initMockup(
   function beginScreenSpace(ctx: CanvasRenderingContext2D): { W: number; H: number } {
     const cw = screenCanvas!.width, ch = screenCanvas!.height;
     ctx.save();
-    if (!SCREEN_TRANSPOSE) return { W: cw, H: ch };
+    if (!SCREEN_TRANSPOSE) {
+      // A quad whose UVs run a half-turn off lands the content upside-down.
+      // scale(-1,-1) about the canvas centre is a true 180° rotation (both
+      // axes), which cancels it while keeping W/H — unlike flipY, which would
+      // fix only the vertical and leave the result mirrored.
+      if (SCREEN_ROTATE180) ctx.setTransform(-1, 0, 0, -1, cw, ch);
+      // A left|right mirror only — independent of (and composable with) the
+      // 180° case above, since a panel can run one axis backwards without
+      // the other.
+      else if (SCREEN_FLIP_X) ctx.setTransform(-1, 0, 0, 1, cw, 0);
+      return { W: cw, H: ch };
+    }
     // Visual space is the canvas with its axes swapped back.
     const W = ch, H = cw;
     if (SCREEN_TRANSPOSE === 'main') ctx.setTransform(0, 1, 1, 0, 0, 0);              // (x,y) -> (y,x)
@@ -1035,7 +1070,18 @@ export function initMockup(
       // laid over the display rather than some unrelated panel elsewhere.
       const ratio = area(size) / sArea;
       const offset = c.distanceTo(sCenter);
-      if (ratio > 0.8 && ratio < 1.25 && offset < Math.max(sSize.x, sSize.y) * 0.12) {
+      // ...and IN FRONT of it. A device's back panel has the same face and the
+      // same centre in x/y as its screen, and only the depth tells them apart,
+      // so a plain distance test claims the back as cover glass. That mistake
+      // is invisible on an opaque back and glaring on a transparent one: the
+      // per-frame walk drives cover glass at `envIntensity * screenGlare`, and
+      // Glare ships at 0, so the Nothing Phone's back glass was having its
+      // reflections multiplied by zero and rendered dead matte from every
+      // angle. Devices are prepared with the screen facing +Z, so the cover
+      // glass sits at or slightly above the screen's own z; the back sits a
+      // whole device-thickness below it.
+      const inFront = c.z >= sCenter.z - Math.max(1e-6, sSize.z) - modelHalf * 0.06;
+      if (ratio > 0.8 && ratio < 1.25 && offset < Math.max(sSize.x, sSize.y) * 0.12 && inFront) {
         mat.userData.isScreenGlass = true;
       }
     }
@@ -1103,31 +1149,170 @@ export function initMockup(
     mat.polygonOffsetUnits = -2;
     mat.depthTest = true;
     mat.depthWrite = true;
-    if (screenMesh) screenMesh.renderOrder = 1000;
+    for (const m of screenMeshes) m.renderOrder = 1000;
   }
 
+  // One material instance is shared by every primary-panel mesh, so the Duo's
+  // two inner quads show one continuous image (each sampling its own UV half).
   function setScreenMaterial(mat: THREE.MeshBasicMaterial) {
-    if (!screenMesh) { mat.dispose(); return; }
-    const old = screenMesh.material as THREE.Material;
-    if (old && old !== screenMesh.userData.origMaterial) old.dispose();
+    if (!screenMeshes.length) { mat.dispose(); return; }
+    disposeScreenMaterials();
     configureScreenComposite(mat);
-    screenMesh.material = mat;
+    if (DEV?.key === 'iphoneduo') console.log('DUODBG setScreenMaterial', screenMeshes.map((m) => ({ name: m.name, visible: m.visible, isSkinned: (m as any).isSkinnedMesh })), mat.map);
+    for (const m of screenMeshes) m.material = mat;
+  }
+
+  // Drop whatever composite material the panels currently share, without
+  // touching the authored one each mesh keeps in userData.
+  function disposeScreenMaterials() {
+    const seen = new Set<THREE.Material>();
+    for (const m of screenMeshes) {
+      const old = m.material as THREE.Material;
+      if (old && old !== m.userData.origMaterial && !seen.has(old)) { seen.add(old); old.dispose(); }
+    }
   }
 
   function restoreScreenMaterial() {
-    if (!screenMesh || !screenMesh.userData.origMaterial) return;
-    const old = screenMesh.material as THREE.Material;
-    if (old && old !== screenMesh.userData.origMaterial) old.dispose();
-    const source = screenMesh.userData.origMaterial as THREE.MeshStandardMaterial;
-    const fallback = new THREE.MeshBasicMaterial({
-      color: source.color?.clone() ?? new THREE.Color(0x000000),
-      map: source.map ?? null,
-      toneMapped: false,
-      transparent: true,
-      alphaTest: 0.001,
-    });
-    configureScreenComposite(fallback);
-    screenMesh.material = fallback;
+    if (!screenMeshes.length) return;
+    disposeScreenMaterials();
+    for (const m of screenMeshes) {
+      const source = m.userData.origMaterial as THREE.MeshStandardMaterial | undefined;
+      if (!source) continue;
+      const fallback = new THREE.MeshBasicMaterial({
+        color: source.color?.clone() ?? new THREE.Color(0x000000),
+        map: source.map ?? null,
+        toneMapped: false,
+        transparent: true,
+        alphaTest: 0.001,
+      });
+      configureScreenComposite(fallback);
+      m.material = fallback;
+    }
+  }
+
+  // ── Extra screens (the foldable Duo's cover panel) ───────────────────────
+  // A device may carry a second display. These are deliberately a SIMPLER
+  // pipeline than the primary panel: still images only, no status-bar overlay
+  // and no video, because the timeline clock, the seek path and the export
+  // frame-stepper all drive the single primary `screenVideoEl`. Giving a second
+  // panel its own clip would mean two clips to keep in lockstep through an
+  // export, which nothing in the UI asks for — the cover is a still.
+  //
+  // Each target owns its canvas, texture and material, so the two panels take
+  // independent uploads and neither can disturb the other.
+  interface ExtraTarget {
+    def: ExtraScreenDef;
+    meshes: THREE.Mesh[];
+    canvas: HTMLCanvasElement | null;
+    ctx: CanvasRenderingContext2D | null;
+    texture: THREE.CanvasTexture | null;
+    material: THREE.MeshBasicMaterial | null;
+    key: string;
+    imageEl: HTMLImageElement | null;
+  }
+  const extraTargets: ExtraTarget[] = (DEV?.extraScreens ?? []).map((def) => ({
+    def, meshes: [], canvas: null, ctx: null, texture: null, material: null, key: '', imageEl: null,
+  }));
+
+  function bindExtraScreens(list: THREE.Mesh[], mats: THREE.Material[]) {
+    for (const t of extraTargets) {
+      t.meshes = [];
+      for (let i = 0; i < list.length; i++) {
+        const mat = mats[i] as any;
+        if (mat.userData.partKey !== t.def.materialName) continue;
+        const m = list[i];
+        t.meshes.push(m);
+        m.userData.origMaterial = m.material;
+        ensureScreenUVs(m);
+        // The panel itself answers to Glass Exposure, same as the primary one.
+        // What it must NOT do is run markScreenGlass()'s scan for a cover
+        // shell: that looks for a mesh of about the panel's own area sitting
+        // in front of it, and on a FOLDABLE a half-sized panel is exactly the
+        // size of one half's outer shell. The cover display therefore claimed
+        // the polished titanium half it sits on as cover glass, and the
+        // per-frame walk drives cover glass at envMapIntensity * Glare with
+        // roughness pushed to 0.6 — Glare ships at 0, so that whole half
+        // rendered dead matte while the other half stayed metallic.
+        mat.userData.isScreenGlass = true;
+        m.renderOrder = 1000;
+      }
+    }
+  }
+
+  // Cover-fit `src` into the target's own panel aspect, corner-masked the same
+  // way the primary panel is. Self-contained rather than routed through
+  // beginScreenSpace(), which carries the primary device's transpose/rotate.
+  function drawExtraFrame(t: ExtraTarget, src: HTMLImageElement) {
+    const { screenAspect, screenCornerFrac } = t.def;
+    const W = 1024;
+    const H = Math.max(1, Math.round(W / screenAspect));
+    if (!t.canvas) { t.canvas = document.createElement('canvas'); t.ctx = t.canvas.getContext('2d'); }
+    if (t.canvas.width !== W || t.canvas.height !== H) { t.canvas.width = W; t.canvas.height = H; }
+    const ctx = t.ctx;
+    if (!ctx) return;
+    ctx.clearRect(0, 0, W, H);
+    ctx.save();
+    // The mirror goes on FIRST, so the corner mask below is cut in the same
+    // space the image is drawn in. Clipping before the flip leaves the mask
+    // un-mirrored while the content is mirrored, which puts the square corners
+    // against the wrong edge — the free one instead of the hinge.
+    if (t.def.screenTextureFlipX) { ctx.translate(W, 0); ctx.scale(-1, 1); }
+    const r = Math.min(W, H) * screenCornerFrac;
+    // roundRect takes its four radii clockwise from the top left. A panel
+    // butted against the hinge is square along that edge only.
+    const e = t.def.screenSharpEdge;
+    const radii: [number, number, number, number] = [
+      e === 'left' || e === 'top' ? 0 : r,        // top left
+      e === 'right' || e === 'top' ? 0 : r,       // top right
+      e === 'right' || e === 'bottom' ? 0 : r,    // bottom right
+      e === 'left' || e === 'bottom' ? 0 : r,     // bottom left
+    ];
+    ctx.beginPath();
+    ctx.roundRect(0, 0, W, H, radii);
+    ctx.clip();
+    const iw = src.naturalWidth || 1, ih = src.naturalHeight || 1;
+    const scale = Math.max(W / iw, H / ih);   // cover
+    const dw = iw * scale, dh = ih * scale;
+    ctx.drawImage(src, (W - dw) / 2, (H - dh) / 2, dw, dh);
+    ctx.restore();
+    if (t.texture) t.texture.needsUpdate = true;
+  }
+
+  function updateExtraScreens() {
+    for (const t of extraTargets) {
+      if (!t.meshes.length) continue;
+      const media = opts.getScreenMediaForSlot?.(t.def.slot) ?? null;
+      const url = media?.url && media.kind === 'image' ? media.url : '';
+      if (url === t.key) continue;
+      t.key = url;
+      if (!url) {
+        t.imageEl = null;
+        for (const m of t.meshes) if (m.userData.origMaterial) m.material = m.userData.origMaterial as THREE.Material;
+        continue;
+      }
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = () => {
+        if (disposed || t.key !== url) return;
+        t.imageEl = img;
+        drawExtraFrame(t, img);
+        if (!t.texture) {
+          t.texture = new THREE.CanvasTexture(t.canvas!);
+          t.texture.colorSpace = THREE.SRGBColorSpace;
+          t.texture.flipY = t.def.screenTextureFlipY ?? true;
+          t.texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+        }
+        t.texture.needsUpdate = true;
+        if (!t.material) {
+          t.material = makeScreenMaterial(t.texture);
+          t.material.polygonOffset = true;
+          t.material.polygonOffsetFactor = 0;
+          t.material.polygonOffsetUnits = -2;
+        }
+        for (const m of t.meshes) m.material = t.material;
+      };
+      img.src = url;
+    }
   }
 
   // ── Which materials the Finish repaints ─────────────────────────────────
@@ -1202,6 +1387,39 @@ export function initMockup(
     }
   }
 
+  // Which materials a device's Finish repaints, named outright.
+  //
+  // markEnclosureMaterials() finds a body by looking for one large, evenly
+  // coloured panel, which is what a unibody phone or tablet is. The Nothing
+  // Phone is not that: its back is a transparent-look assembly of dozens of
+  // small textured plates, and not one of them clears the panel-size gate, so
+  // the scan marked nothing and the Finish control did nothing at all.
+  //
+  // This mesh does name its materials, though, so for it the body can simply be
+  // stated. Only the parts that actually change colour between the white and
+  // black variants are listed: the plates and the frame. The camera rings, the
+  // Glyph matrix, the lenses and the screws are black on both, and naming them
+  // here would wash them out the moment a light finish was picked.
+  const ENCLOSURE_BY_MATERIAL: Record<string, string[]> = {
+    nothingphone3: ['back panel', 'back panel.001', 'frame', 'frame.001', 'logo.001', 'logo.002'],
+    // Apple Watch Ultra 3: repaint only the titanium case. The crown ring and
+    // the band ('Watch Crown Ring', 'Watch Strap') are the Ultra's orange
+    // accent — naming them here would flood that orange out the moment a finish
+    // is picked, so they stay as authored.
+    applewatchultra3: ['Watch Body', 'Watch Crown'],
+  };
+
+  function markEnclosureByMaterialName() {
+    const names = DEV ? ENCLOSURE_BY_MATERIAL[DEV.key] : undefined;
+    if (!names) return;
+    let hit = 0;
+    for (const m of materials as any[]) {
+      if (m.userData.partKey === 'Screen') continue;
+      if (names.includes(m.userData.partKey as string)) { m.userData.isEnclosure = true; hit++; }
+    }
+    if (!hit) console.warn(`[mockup] no material matched the enclosure list for ${DEV?.key}`);
+  }
+
   function markIPhoneAirRearPanelAsEnclosure() {
     if (DEV?.key !== 'iphoneair') return;
     for (let i = 0; i < meshList.length; i++) {
@@ -1234,8 +1452,25 @@ export function initMockup(
   // Keyed by material name: machine-generated, but stable inside these
   // committed assets. A name that no longer resolves is a silent no-op, so a
   // re-exported mesh degrades to today's appearance instead of throwing.
-  const MATTE_PANEL_FIXUPS: Record<string, Array<{ panel: string; copyFrom?: string }>> = {
+  const MATTE_PANEL_FIXUPS: Record<string, Array<{
+    panel: string; copyFrom?: string;
+    metalness?: number; roughness?: number; opacity?: number;
+  }>> = {
     ipadpro:   [{ panel: 'WHeurdvnNmzlaVj', copyFrom: 'AQYGetoGtanvwug' }],
+    // The Nothing Phone's back glass is authored metalness 1 / opacity 0.2.
+    // Three blends a transparent material by scaling EVERYTHING it outputs,
+    // specular included, so four fifths of its reflection was being thrown
+    // away — which is why the back read as dead matte from every angle while
+    // the camera rings, which are opaque, caught light normally.
+    //
+    // A cover glass is a dielectric, not a metal, so metalness drops to 0 and
+    // roughness to a polished 0.05. Opacity rises only as far as 0.45: the
+    // whole point of this device is the components showing through, and an
+    // opaque back would hide them.
+    nothingphone3: [
+      { panel: 'glass',     metalness: 0, roughness: 0.05, opacity: 0.45 },
+      { panel: 'glass.001', metalness: 0, roughness: 0.05, opacity: 0.45 },
+    ],
   };
 
   function repairMattePanels() {
@@ -1251,9 +1486,18 @@ export function initMockup(
         target.metalness = source.metalness;
         target.roughness = source.roughness;
       }
+      // Explicit values, for a panel with no correctly-authored sibling to copy.
+      const fx = fixes.find((f) => f.panel === panel)!;
+      if (fx.metalness !== undefined) target.metalness = fx.metalness;
+      if (fx.roughness !== undefined) target.roughness = fx.roughness;
+      if (fx.opacity !== undefined) {
+        target.opacity = fx.opacity;
+        target.transparent = fx.opacity < 1;
+      }
       // The micro-roughness noise multiplies against this baseline, so it has
       // to move with the roughness or the panel keeps the old surface response.
       if (source) target.userData.origRoughness = source.roughness;
+      if (fx.roughness !== undefined) target.userData.origRoughness = fx.roughness;
       target.needsUpdate = true;
     }
   }
@@ -1353,11 +1597,31 @@ export function initMockup(
   let model: THREE.Object3D | null = null;
 
   if (MODEL_URL) loadGLBSource(MODEL_URL).then(
-    (source) => {
+    ({ scene: source, animations }) => {
       if (disposed) return;
       // Keep the cached source pristine: this renderer fits the root and owns
       // per-instance material state, while thumbnail rendering has its own clone.
-      model = source.clone(true);
+      // A rigged source (the foldable Duo) needs SkeletonUtils' clone — the
+      // plain Object3D.clone() copies each bone as an unrelated Object3D, so
+      // the copied SkinnedMesh ends up skinned to the ORIGINAL skeleton and
+      // every instance shares one pose.
+      let hasSkinned = false;
+      source.traverse((o) => { if ((o as THREE.SkinnedMesh).isSkinnedMesh) hasSkinned = true; });
+      model = hasSkinned ? cloneSkinned(source) : source.clone(true);
+      if (hasSkinned && animations.length) {
+        foldMixer = new THREE.AnimationMixer(model);
+        const clip = animations.find((c) => c.name === DEV?.foldAnimationClip) ?? animations[0];
+        foldAction = foldMixer.clipAction(clip);
+        foldAction.play();
+        foldAction.paused = true;
+        foldClipDuration = clip.duration;
+      }
+      // Some sources (the Duo's product-viewer rig, authored lying flat for
+      // its own "drag to fold" widget) don't share the bundled devices' own
+      // convention of standing with the screen facing +Z. Applied to the
+      // model itself, before fitAndCenter measures it, so the user's own
+      // Rotate X/Y/Z stay zeroed at a normal starting pose.
+      if (DEV?.baseRotationX) model.rotation.x = THREE.MathUtils.degToRad(DEV.baseRotationX);
       const keys: string[] = [];
       model.traverse((o) => {
         const mesh = o as THREE.Mesh;
@@ -1403,6 +1667,7 @@ export function initMockup(
       });
       repairMattePanels();
       markEnclosureMaterials();
+      markEnclosureByMaterialName();
       markIPhoneAirRearPanelAsEnclosure();
       modelHalf = fitAndCenter(model, MODEL_SIZE);
       const box = new THREE.Box3().setFromObject(model);
@@ -1410,13 +1675,17 @@ export function initMockup(
       pivot.add(model);
       computeGroupData();
       frameCamera();
-      screenMesh = meshList.find((_, i) => materials[i].userData.partKey === 'Screen') ?? null;
-      if (screenMesh) {
-        screenMesh.userData.origMaterial = screenMesh.material;
-        ensureScreenUVs(screenMesh);
-        markScreenGlass(screenMesh);
-        restoreScreenMaterial();
+      // The primary panel can be more than one mesh: the foldable Duo's inner
+      // display is a quad per half, both tagged with the same material and
+      // sharing one texture (their UVs split it left|right).
+      screenMeshes = meshList.filter((_, i) => materials[i].userData.partKey === PRIMARY_SCREEN_MAT);
+      for (const m of screenMeshes) {
+        m.userData.origMaterial = m.material;
+        ensureScreenUVs(m);
+        markScreenGlass(m);
       }
+      if (screenMeshes.length) restoreScreenMaterial();
+      bindExtraScreens(meshList, materials);
       opts.onParts?.(keys);
       canvas.dataset.modelReady = 'true';
     },
@@ -1498,6 +1767,8 @@ export function initMockup(
     // UV origin is bottom-left; the picked point arrives in top-down viewport
     // space, so Y is stored as the user sees it and flipped here.
     blurMat.uniforms.uCentre.value.set(Number(p.blurFocusX ?? 0.5), 1 - Number(p.blurFocusY ?? 0.5));
+    blurMat.uniforms.uAxisX.value = isOn(p.blurAxisX ?? 'On') ? 1 : 0;
+    blurMat.uniforms.uAxisY.value = isOn(p.blurAxisY ?? 'On') ? 1 : 0;
     renderer.render(blurScene, blurCam);
   }
 
@@ -1619,13 +1890,16 @@ export function initMockup(
         m.roughness = base + (0.6 - base) * (1 - screenGlare);
       }
 
-      // Per-group exposure. The enclosure — frame and rear panel — answers to
-      // Body Exposure; everything else the device owns (cover glass, bezel,
-      // Dynamic Island, camera rings, buttons) answers to Glass Exposure. The
-      // Screen mesh leaves this loop above, so screen content keeps its own
-      // brightness under either slider.
+      // Per-group exposure. Glass Exposure drives ONLY the cover glass (the
+      // Screen mesh and any shell detected in front of it, both flagged
+      // isScreenGlass); everything else the device owns — frame, rear panel,
+      // bezel, camera rings, buttons — answers to Body Exposure. Keyed on
+      // isScreenGlass rather than isEnclosure so it holds on devices whose
+      // enclosure scan matches nothing (e.g. iPhone 18 Pro, iPhone Duo): with
+      // the old isEnclosure test those marked no body, so Glass Exposure moved
+      // the whole device and Body Exposure moved nothing.
       if (m.userData.exposureGain) {
-        m.userData.exposureGain.value = m.userData.isEnclosure ? bodyGain : glassGain;
+        m.userData.exposureGain.value = m.userData.isScreenGlass ? glassGain : bodyGain;
       }
 
       m.wireframe = wire;
@@ -1652,7 +1926,7 @@ export function initMockup(
     const screenStatus = opts.getScreenStatus?.();
     const hasEmptyStatusScreen = DEV?.slot === 'phone' && screenStatus?.mode !== 'off';
     const mkey2 = media ? `${media.kind}|${media.url}` : hasEmptyStatusScreen ? 'empty-status-screen' : '';
-    if (screenMesh && mkey2 !== screenKey) {
+    if (screenMeshes.length && mkey2 !== screenKey) {
       screenKey = mkey2;
       if (screenVideoEl) { screenVideoEl.pause(); screenVideoEl.removeAttribute('src'); screenVideoEl.load(); screenVideoEl = null; }
       if (media || hasEmptyStatusScreen) {
@@ -1701,11 +1975,17 @@ export function initMockup(
     }
     syncScreenVideoToTimeline();
     paintScreenContent();
+    updateExtraScreens();
     // Screen Brightness — the display is unlit (MeshBasicMaterial), so no light
     // reaches it; scaling the material colour is what dims/boosts the panel.
-    if (screenMesh && screenMesh.material !== screenMesh.userData.origMaterial) {
+    {
       const sb = Math.max(0, Number(p.screenBrightness ?? 1));
-      (screenMesh.material as THREE.MeshBasicMaterial).color.setScalar(sb);
+      for (const m of screenMeshes) {
+        if (m.material !== m.userData.origMaterial) (m.material as THREE.MeshBasicMaterial).color.setScalar(sb);
+      }
+      for (const t of extraTargets) {
+        if (t.material) t.material.color.setScalar(sb);
+      }
     }
 
     const md = opts.getModel?.();
@@ -1750,6 +2030,11 @@ export function initMockup(
       Number(p.fieldOfView ?? 42),
       Number(p.lidAngle ?? 112),
     );
+    if (foldAction && foldClipDuration > 0) {
+      const pct = Math.max(0, Math.min(100, Number(p.foldAngle ?? 100))) / 100;
+      foldAction.time = (DEV?.foldAnimationReverse ? 1 - pct : pct) * foldClipDuration;
+      foldMixer!.update(0);
+    }
 
     // Dynamic studio lighting choreography synced with camera animation
     applyLightRig(p, lightState);
@@ -1818,6 +2103,11 @@ export function initMockup(
       Number(p.fieldOfView ?? 42),
       Number(p.lidAngle ?? 112),
     );
+    if (foldAction && foldClipDuration > 0) {
+      const pct = Math.max(0, Math.min(100, Number(p.foldAngle ?? 100))) / 100;
+      foldAction.time = (DEV?.foldAnimationReverse ? 1 - pct : pct) * foldClipDuration;
+      foldMixer!.update(0);
+    }
     applyLightRig(p, lightState);
     settleGroundUnderModel();   // after the animation has posed the pivot
     rig.update();
@@ -1902,6 +2192,7 @@ export function initMockup(
     opts.onRenderer?.(null);
     opts.onCamera?.(null);
     cancelAnimationFrame(animId);
+    foldMixer?.stopAllAction();
     ro.disconnect();
     canvas.removeEventListener('pointerdown', onDown);
     canvas.removeEventListener('pointerup', onUp);
@@ -1915,9 +2206,10 @@ export function initMockup(
     (ground.material as THREE.Material).dispose();
     if (screenVideoEl) { screenVideoEl.pause(); screenVideoEl.removeAttribute('src'); screenVideoEl.load(); }
     if (screenCanvasTex) screenCanvasTex.dispose();
-    if (screenMesh) {
-      const sm = screenMesh.material as THREE.Material;
-      if (sm && sm !== screenMesh.userData.origMaterial) sm.dispose();
+    disposeScreenMaterials();
+    for (const t of extraTargets) {
+      t.texture?.dispose();
+      t.material?.dispose();
     }
     for (const m of materials) m.dispose();
     // Geometry belongs to the shared parsed GLB cache. Materials are cloned

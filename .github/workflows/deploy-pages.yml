@@ -45,10 +45,15 @@ jobs:
       - name: Add .nojekyll
         run: touch out/.nojekyll
 
-      # Pages must be enabled once in Settings > Pages > Source: GitHub Actions.
-      # The workflow token cannot create/enable the Pages site for the repository.
+      # `enablement: true` creates the Pages site on first run and points it at
+      # Actions, using the job's own `pages: write` token — so a fresh fork or
+      # clone deploys without anyone visiting Settings first. Without it the
+      # action only READS the Pages config and the build dies here on
+      # "Get Pages site failed ... Not Found", with the export already built.
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
+        with:
+          enablement: true
 
       - name: Upload GitHub Pages artifact
         uses: actions/upload-pages-artifact@v4
