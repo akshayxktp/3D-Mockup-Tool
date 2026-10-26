@@ -1,4 +1,6 @@
+import * as THREE from 'three';
 import { use3DStore } from '@/store/use3DStore';
+import { MATTE_FINISHES } from './deviceFinishes';
 
 // ── Device library (Mockup mode) ────────────────────────────────────────────
 // Real device meshes + finish presets, mirrored from the reference tool's own
@@ -6,7 +8,31 @@ import { use3DStore } from '@/store/use3DStore';
 // device and a finish here behaves the way it does there. `fitHeight` is the
 // reference's own tuned camera-fit size for each mesh — reused verbatim so each
 // device frames correctly on first load.
-export interface DeviceFinish { key: string; label: string; hex: string; }
+export interface DeviceFinish {
+  key: string;
+  label: string;
+  hex: string;
+  // Exact per-MESH albedo for the finish, keyed by the mesh's prim name inside
+  // the .usdz. Apple's own appearance layer (shipped in Matte, see
+  // three3d/deviceFinishes.ts) works this way: a finish is a set of material
+  // colours, not one tint applied to every "enclosure-ish" material. When
+  // present, the generic enclosure heuristic in three3d/mockup.ts is skipped
+  // and these colours are written straight onto the meshes.
+  materialColors?: Record<string, string>;
+  // Base-colour texture grades for finishes whose body maps carry the sheen
+  // (mostly Apple's anodised frames). Same keys as materialColors.
+  textureAdjustments?: Record<string, {
+    exposure: number; brightness: number; contrast: number;
+    saturation: number; hueDegrees: number;
+  }>;
+  // Metallic/roughness/clearcoat overrides for finishes that change the surface
+  // itself rather than just its colour — Matte's Night Sky Duo band is
+  // 0.8-metallic, and its 18 Pro blacks sit at 0.4. Keyed like materialColors.
+  materialScalars?: Record<string, {
+    metallic?: number; roughness?: number;
+    clearcoat?: number; clearcoatRoughness?: number;
+  }>;
+}
 
 // Which screen an uploaded asset belongs to. Assets are held PER SLOT, not per
 // device, so one phone screenshot serves every phone and switching device keeps
@@ -50,6 +76,10 @@ export interface ExtraScreenDef {
 export interface DeviceDef {
   key: string;
   label: string;
+  // Listed under the picker's "New Devices" section rather than the main
+  // library. The flag lives on the device, not in the panel, so a saved
+  // project still resolves its model through the same single DEVICES array.
+  isNew?: boolean;
   modelUrl: string;        // local copy, served from /public/3d/devices
   fitHeight: number;       // world-size the model is fitted to (see three3d/frame.ts)
   screenAspect: number;    // the "Screen" mesh's own w/h — used to cover-fit uploaded media
@@ -81,12 +111,28 @@ export interface DeviceDef {
   // set this when 100% on the slider needs to map to time 0 instead of the
   // clip's end.
   foldAnimationReverse?: boolean;
+  // Fixed-pose AR Duo: bend its mesh vertices around the model-space hinge.
+  foldGeometryHinge?: boolean;
   // A one-time correction applied to the model before it's fitted, for a
   // source authored lying flat (screen normal along +Y) rather than in this
   // library's own standing convention (screen normal along +Z). Every
   // converted device already has this baked into its GLB; this exists for a
   // source used as-is, like the Duo's rigged product-viewer asset.
   baseRotationX?: number;
+  // Same idea for a source rolled or spun about another axis. An AR Quick Look
+  // package is exported in whatever pose Apple photographed the product in —
+  // the iPhone Air, for one, ships with its screen facing +X — so the device
+  // library carries the correction rather than editing the asset.
+  baseRotationY?: number;
+  baseRotationZ?: number;
+  // AR Quick Look packages routinely ship the product TWICE (two sizes, or a
+  // front-facing and a back-facing copy). `hideNodes` drops named subtrees and
+  // `hideBox` drops every mesh whose centre falls inside this model-space box,
+  // for packages whose two copies share node names. Both are applied before
+  // the model is fitted and before materials are collected, so the hidden copy
+  // never reaches the screen binding, the part picker or the material list.
+  hideNodes?: string[];
+  hideBox?: [number, number, number, number, number, number];
   slot: ScreenSlot;
   // The panel's real native pixels, shown in the UI so a screenshot can be
   // prepared at the right size. Verified against Apple's own tech specs.
@@ -327,14 +373,178 @@ export const DEVICES: DeviceDef[] = [
       { slot: 'duoOuter', materialName: 'Screen', screenAspect: 0.69, screenCornerFrac: 0.09, screenPx: [1080, 1562], screenTextureFlipY: false, screenTextureFlipX: true, screenSharpEdge: 'left' },
     ],
     finishes: [
-      { key: 'starwhite', label: 'Star White', hex: '#f2f2f2' },
-      { key: 'black', label: 'Space Black', hex: '#3b3b3d' },
+      // Matte ships two: the authored Star White and a dark navy Night Sky.
+      // The rig's GLB predates the appearance layer, so Night Sky goes through
+      // the neutral-finish remap rather than an exact per-mesh table; the AR
+      // Duo in New Devices carries Matte's exact thirteen-panel colours.
+      { key: 'starwhite', label: 'Star White', hex: '#F2F2F2' },
+      { key: 'night-sky', label: 'Night Sky', hex: '#0D2130' },
     ],
+  },
+
+  // ── New Devices ──────────────────────────────────────────────────────────
+  // Straight from Apple's own AR Quick Look packages (the .usdz files Apple
+  // serves on each product page). They are loaded as authored, through the
+  // same USD path as the HomeView above, with three corrections recorded here
+  // rather than baked into the assets:
+  //
+  //   · each display is tagged by its own mesh name — a USD package carries no
+  //     material names at all, so partKeyOf() falls back to the mesh name;
+  //   · duplicated copies (Apple ships two sizes, or front and back, in some
+  //     packages) are dropped with hideNodes / hideBox;
+  //   · a pose correction, measured from the display's own surface normals,
+  //     squares each device up. DELIBERATELY absent for the laptops and the
+  //     iPad-on-keyboard: those screens genuinely face up and back at ~20-30°
+  //     and the existing MacBook Pro 14" GLB holds the same tilt, so squaring
+  //     them would tip the keyboard off the ground.
+  //
+  // These AR meshes ship in a single finish, so each lists exactly one — the
+  // Finish control then shows the authored colour and never repaints (see
+  // isFinished in three3d/mockup.ts, which treats finishes[0] as "leave be").
+  {
+    key: 'iphone17ar', label: 'iPhone 17', isNew: true, modelUrl: '/3d/devices/iphone-17-e-sim.usdz', fitHeight: 2.077,
+    screenAspect: 0.459, screenCornerFrac: 0.13, slot: 'phone', screenPx: [1206, 2622],
+    screenMaterial: 'eXcdWRctfHqyWLU',
+    finishes: MATTE_FINISHES.iphone17,
+  },
+  {
+    // Apple's package ships this phone TWICE — a Pro and a Pro Max, back to
+    // back. The copy facing +Z is the one kept; the other is dropped by its
+    // subtree name. screenMaterial resolves after the drop, leaving one panel.
+    key: 'iphone17proar', label: 'iPhone 17 Pro (AR)', isNew: true, modelUrl: '/3d/devices/iphone-17-pro-e-sim.usdz', fitHeight: 2.077,
+    screenAspect: 0.462, screenCornerFrac: 0.13, slot: 'phone', screenPx: [1206, 2622],
+    screenMaterial: 'HkNSnYzBPABcqwM',
+    hideNodes: ['RQNEPvSqUMnJxkk'],
+    finishes: MATTE_FINISHES.iphone17pro,
+  },
+  {
+    // Same two copies as the 17 Pro, but here they share node names, so the
+    // extra one is dropped by position instead — a plane in front of the copy
+    // whose display faces +Z.
+    key: 'iphone18proar', label: 'iPhone 18 Pro (AR)', isNew: true, modelUrl: '/3d/devices/iphone-18-pro-e-sim.usdz', fitHeight: 2.077,
+    screenAspect: 0.462, screenCornerFrac: 0.13, slot: 'phone', screenPx: [1206, 2622],
+    screenMaterial: 'EHjrGDHNHzgNjtE',
+    hideBox: [-99, 99, -99, 99, 0.7, 99],
+    finishes: MATTE_FINISHES.iphone18pro,
+  },
+  {
+    // Exported with its screen facing +X; a quarter turn about Y stands it up.
+    key: 'iphoneairar', label: 'iPhone Air (AR)', isNew: true, modelUrl: '/3d/devices/iphone-air-e-sim.usdz', fitHeight: 2.077,
+    screenAspect: 0.46, screenCornerFrac: 0.124, slot: 'phone', screenPx: [1260, 2736],
+    screenMaterial: 'tppzCQmnlKcHIpP',
+    baseRotationY: 90,
+    finishes: MATTE_FINISHES.iphoneair,
+  },
+  {
+    // On its Magic Keyboard, open at the keyboard's own working angle (~30°).
+    // Left as authored for the reason above; fitHeight is a little larger than
+    // the tablet entries because the open unit's longest axis is its depth.
+    key: 'ipadpro13m4black', label: 'iPad Pro 13″ (M4, Black)', isNew: true, modelUrl: '/3d/devices/ipad-pro-13-M4-black.usdz', fitHeight: 1.75,
+    screenAspect: 1.333, screenCornerFrac: 0.014, slot: 'tablet', screenPx: [2752, 2064],
+    screenMaterial: 'ifuqiaWvBiLVOJa',
+    finishes: [{ key: 'spaceblack', label: 'Space Black', hex: '#1d1d1f' }],
+  },
+  {
+    key: 'ipadpro13m4silver', label: 'iPad Pro 13″ (M4, Silver)', isNew: true, modelUrl: '/3d/devices/ipad-pro-13-M4-silver.usdz', fitHeight: 1.75,
+    screenAspect: 1.333, screenCornerFrac: 0.014, slot: 'tablet', screenPx: [2752, 2064],
+    screenMaterial: 'AuxUZFpIdyYVcpo',
+    finishes: [{ key: 'silver', label: 'Silver', hex: '#c6c7c8' }],
+  },
+  {
+    key: 'macbookpro14m4', label: 'MacBook Pro 14″ (M4)', isNew: true, modelUrl: '/3d/devices/macbook-pro-14-2024-M4-space-black.usdz', fitHeight: 1.3,
+    screenAspect: 1.54, screenCornerFrac: 0.0086, slot: 'laptop', screenPx: [3024, 1964],
+    screenMaterial: 'YdXejmlVmqnwRvk',
+    finishes: [{ key: 'spaceblack', label: 'Space Black', hex: '#565457' }],
+  },
+  {
+    key: 'macbookpro14m5', label: 'MacBook Pro 14″ (2025)', isNew: true, modelUrl: '/3d/devices/macbook-pro-14-2025-space-black.usdz', fitHeight: 1.3,
+    screenAspect: 1.54, screenCornerFrac: 0.0086, slot: 'laptop', screenPx: [3024, 1964],
+    screenMaterial: 'tfTbkkzhxqpKRgC',
+    finishes: [{ key: 'spaceblack', label: 'Space Black', hex: '#565457' }],
+  },
+  {
+    // 16" is 14% wider than the 14"; the same 1.3 fit would shrink it to the
+    // same on-screen width, so the fit scales with the real width.
+    key: 'macbookpro16m4', label: 'MacBook Pro 16″ (M4)', isNew: true, modelUrl: '/3d/devices/macbook-pro-16-2024-M4-space-black.usdz', fitHeight: 1.48,
+    screenAspect: 1.547, screenCornerFrac: 0.0086, slot: 'laptop', screenPx: [3456, 2234],
+    screenMaterial: 'NbrsdUjHEUCinvO',
+    finishes: [{ key: 'spaceblack', label: 'Space Black', hex: '#565457' }],
+  },
+  {
+    key: 'imac24', label: 'iMac 24″', isNew: true, modelUrl: '/3d/devices/imac-24-silver.usdz', fitHeight: 1.5,
+    screenAspect: 1.778, screenCornerFrac: 0.012, slot: 'display', screenPx: [4480, 2520],
+    screenMaterial: 'HVXqYfVCwGuzJFM',
+    baseRotationX: 8,
+    finishes: [{ key: 'silver', label: 'Silver', hex: '#d8d8da' }],
+  },
+  {
+    key: 'studiodisplayar', label: 'Studio Display (AR)', isNew: true, modelUrl: '/3d/devices/studio-display.usdz', fitHeight: 1.5,
+    screenAspect: 1.778, screenCornerFrac: 0.012, slot: 'display', screenPx: [5120, 2880],
+    screenMaterial: 'IZJsAfohLAwOHok',
+    finishes: [{ key: 'silver', label: 'Silver', hex: '#d8d8da' }],
+  },
+  {
+    // Apple's AR package carries the original band, hinge and camera materials.
+    // Its open pose has no animation clip, so the fold slider bends its right
+    // half around the authored centre seam in model coordinates.
+    key: 'iphoneduoar', label: 'iPhone Duo (AR)', isNew: true, modelUrl: '/3d/devices/iPhone_Duo_e-sim_Star-White_Variant.usdz', fitHeight: 2.3,
+    screenAspect: 1.42, screenCornerFrac: 0.05, slot: 'duoInner', screenPx: [2960, 2072],
+    screenMaterial: 'UXtsBZYlaUvHoEh',
+    baseRotationX: 90,
+    foldGeometryHinge: true,
+    finishes: MATTE_FINISHES.iphoneduo,
+  },
+  {
+    // The AR watches are posed on their bands, face tilted 35° up. Squared up
+    // here so the face reads straight on, the way the bundled Ultra 3 GLB is.
+    key: 'applewatchseries11', label: 'Apple Watch Series 11', isNew: true, modelUrl: '/3d/devices/watch-series-11.usdz', fitHeight: 1.9,
+    screenAspect: 0.839, screenCornerFrac: 0.17, slot: 'watch', screenPx: [416, 496],
+    screenMaterial: 'stReeZuRtRzZwdd',
+    baseRotationX: 35,
+    finishes: MATTE_FINISHES.watchs11,
+  },
+  {
+    key: 'applewatchultra3ar', label: 'Apple Watch Ultra 3 (AR)', isNew: true, modelUrl: '/3d/devices/watch-ultra-3.usdz', fitHeight: 1.9,
+    screenAspect: 0.821, screenCornerFrac: 0.16, slot: 'watch', screenPx: [422, 514],
+    screenMaterial: 'LBTKGOnjodxPkhe',
+    baseRotationX: 35,
+    finishes: MATTE_FINISHES.watchultra3,
   },
 ];
 
 export function findDevice(modelUrl: string | null | undefined): DeviceDef | undefined {
   return DEVICES.find((d) => d.modelUrl === modelUrl);
+}
+
+// Everything a device needs done to the raw asset before it is fitted, posed or
+// rendered: drop the extra copies some AR packages ship, then apply the pose
+// correction. Shared by the main stage (three3d/mockup.ts) and the preset
+// thumbnails (components/MockupThumb.tsx) so a thumbnail can never show two
+// phones where the stage shows one.
+export function prepareDeviceModel(root: THREE.Object3D, dev: DeviceDef | undefined): void {
+  if (!dev) return;
+  if (dev.hideNodes?.length) {
+    const drop: THREE.Object3D[] = [];
+    root.traverse((o) => { if (o.name && dev.hideNodes!.includes(o.name)) drop.push(o); });
+    for (const o of drop) o.removeFromParent();
+  }
+  if (dev.hideBox) {
+    const [x0, x1, y0, y1, z0, z1] = dev.hideBox;
+    const box = new THREE.Box3(new THREE.Vector3(x0, y0, z0), new THREE.Vector3(x1, y1, z1));
+    root.updateMatrixWorld(true);
+    const drop: THREE.Object3D[] = [];
+    root.traverse((o) => {
+      const m = o as THREE.Mesh;
+      if (!m.isMesh) return;
+      if (box.containsPoint(new THREE.Box3().setFromObject(m).getCenter(new THREE.Vector3()))) drop.push(o);
+    });
+    for (const o of drop) o.removeFromParent();
+  }
+  root.rotation.set(
+    THREE.MathUtils.degToRad(dev.baseRotationX ?? 0),
+    THREE.MathUtils.degToRad(dev.baseRotationY ?? 0),
+    THREE.MathUtils.degToRad(dev.baseRotationZ ?? 0),
+  );
 }
 
 // Single source of truth for "load this device" — used by both the device
@@ -345,6 +555,10 @@ export function selectDevice(key: string): void {
   if (!dev) return;
   const s = use3DStore.getState();
   s.setModelUrl(dev.modelUrl, dev.label);
+  // Finish is a shared mockup parameter, but the swatch belongs to the
+  // selected device. Never carry (for example) iPhone 17 Lavender over to an
+  // Air or Pro model that has a different finish palette.
+  s.setParam('mockup', 'finish', dev.finishes[0]?.hex ?? '');
   s.setModelScale(1);
   s.centerModel(0, 0);                          // device meshes are already bbox-centred
   s.setParam('mockup', 'useModelColor', 'On');   // show its real materials first

@@ -1,0 +1,24 @@
+const puppeteer = require('puppeteer-core');
+const CHROME='/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+const sleep=(ms)=>new Promise(r=>setTimeout(r,ms));
+(async()=>{
+  const browser=await puppeteer.launch({executablePath:CHROME,headless:'shell',args:['--use-gl=angle','--use-angle=metal','--enable-unsafe-swiftshader']});
+  const page=await browser.newPage();
+  await page.setViewport({width:1440,height:900});
+  await page.goto('http://localhost:3000/mockup',{waitUntil:'networkidle2'});
+  await page.waitForSelector('.tpl-item',{timeout:60000});
+  await page.evaluate(()=>{localStorage.setItem('motion-welcome-seen','1');localStorage.setItem('motion-tour-seen','1');localStorage.setItem('motion-mockup-tour-seen','1');});
+  await page.reload({waitUntil:'networkidle2'});
+  await page.waitForSelector('.tpl-item',{timeout:60000});
+  await page.evaluate(()=>document.querySelector('.tour-card .link-btn')?.click());
+  await sleep(800);
+  await page.evaluate(()=>{const r=[...document.querySelectorAll('.tpl-item')].find(r=>r.querySelector('.tpl-name')?.textContent?.trim()==='iPhone 17');r?.click();});
+  await sleep(5000);
+  const before=await page.evaluate(()=>[...document.querySelectorAll('.finish-swatch')].map(b=>({l:b.getAttribute('aria-label'),p:b.getAttribute('aria-pressed'),c:b.style.background})));
+  console.log('swatches', JSON.stringify(before));
+  await page.evaluate(()=>document.querySelector('.finish-swatch[aria-label="Mist Blue"]')?.click());
+  await sleep(2000);
+  const after=await page.evaluate(()=>({active:[...document.querySelectorAll('.finish-swatch')].filter(b=>b.getAttribute('aria-pressed')==='true').map(b=>b.getAttribute('aria-label')), badges:[...document.querySelectorAll('.badge')].map(b=>b.textContent), ls:Object.keys(localStorage)}));
+  console.log('after', JSON.stringify(after));
+  await browser.close();
+})();

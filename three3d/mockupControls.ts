@@ -52,11 +52,19 @@ export const mockupGroups: ControlGroup[] = [
   {
     title: 'Lights',
     controls: [
-      // A named look, applied as multipliers and colour shifts over the four
-      // sliders below rather than as replacement values — so the sliders keep
-      // working after a preset is chosen, and Default is a true no-op that
-      // returns the rig to exactly what it ships with.
-      { key: 'lightPreset', label: 'Lighting', type: 'select', options: ['Default', 'Studio Soft', 'Dark Rim', 'Two Tone', 'Warm Glow'], default: 'Default' },
+      // Matte's Lighting panel is a list of five real studio HDRIs, not a set
+      // of colour grades: picking one swaps the image that lights the scene and
+      // supplies every reflection on the device. These are the app's own five
+      // maps (see three3d/studioEnvironments.ts), in its own order.
+      { key: 'lightPreset', label: 'Environment', type: 'select', options: ['Studio 01', 'Studio 02', 'Studio 03', 'Studio 04', 'Studio 05'], default: 'Studio 01' },
+      // Matte exposes the sphere as two dials — "Rotate the environment
+      // horizontally (moves reflections)" and a vertical one — because a softbox
+      // on the left of a handset is a different product shot from one overhead.
+      { key: 'envRotation', label: 'Environment Rotation', type: 'slider', min: -180, max: 180, step: 1, default: 0, unit: '°' },
+      { key: 'envPitch', label: 'Environment Height', type: 'slider', min: -90, max: 90, step: 1, default: 0, unit: '°' },
+      // Matte's "Hide/Show Environment Background": the map itself behind the
+      // device, a virtual cyc wall rather than the studio backdrop panel.
+      { key: 'envBackground', label: 'Environment Background', type: 'toggle', options: ['Off', 'On'], default: 'Off' },
       // The reference tool steers its key light from a 2D "light direction"
       // pad rather than a position; these are that pad's two axes, and its
       // measured defaults (-26°, 0°). Applied as an offset on top of whatever
@@ -66,9 +74,9 @@ export const mockupGroups: ControlGroup[] = [
       // A stronger key against a lower fill/ambient floor is what actually
       // reads as "sharp" — enough contrast that the device's edges and finish
       // stay defined instead of washing into the bright backdrop.
-      { key: 'keyLight', label: 'Key Light', type: 'slider', min: 0, max: 6, step: 0.1, default: 3.2 },
-      { key: 'fillLight', label: 'Fill Light', type: 'slider', min: 0, max: 4, step: 0.1, default: 1 },
-      { key: 'ambient', label: 'Ambient', type: 'slider', min: 0, max: 3, step: 0.1, default: 0.55 },
+      { key: 'keyLight', label: 'Key Light', type: 'slider', min: 0, max: 6, step: 0.1, default: 2.2 },
+      { key: 'fillLight', label: 'Fill Light', type: 'slider', min: 0, max: 4, step: 0.1, default: 0.8 },
+      { key: 'ambient', label: 'Ambient', type: 'slider', min: 0, max: 3, step: 0.1, default: 0.35 },
       { key: 'envIntensity', label: 'Reflections', type: 'slider', min: 0, max: 3, step: 0.05, default: 1.1 },
       // How big the key light reads as a SOURCE. A small source throws a hard,
       // sharp-edged shadow; a large one (a softbox close in) throws a wide
