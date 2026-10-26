@@ -2,7 +2,7 @@
 
 import { getThreeEffect, threeEffects } from '@/three3d';
 import { use3DStore } from '@/store/use3DStore';
-import { ControlRow } from './Controls';
+import { ControlRow, controlVisible } from './Controls';
 import { SectionHead, useSection } from './PanelSection';
 import type { ControlGroup } from '@/three3d/asciiControls';
 
@@ -24,15 +24,19 @@ function sameValue(a: unknown, b: unknown): boolean {
 //
 // Its own component because the fold state is a hook, and a hook cannot be
 // called from inside a .map over the groups.
-function E3DGroup({ group, sectionId, params, onChange, onReset }: {
+function E3DGroup({ group, sectionId, params, values, onChange, onReset }: {
   group: ControlGroup;
   sectionId?: string;
   params: Record<string, unknown>;
+  // params merged over every group's defaults. A visibleWhen rule may name a
+  // control the user has never touched (so it is absent from params) or one in
+  // another group, and either would read as undefined against raw params.
+  values: Record<string, unknown>;
   onChange: (key: string, value: unknown) => void;
   onReset: () => void;
 }) {
   const [open, toggle] = useSection(sectionId);
-  const controls = group.controls.map((c) => (
+  const controls = group.controls.filter((c) => controlVisible(c, values)).map((c) => (
     <ControlRow
       key={c.key}
       def={c}
@@ -74,6 +78,11 @@ export default function Effect3DControls({ effectId: forcedEffectId, collapsible
   const def = getThreeEffect(forcedEffectId ?? storeEffectId) ?? threeEffects[0];   // guard stale ids
   const effectId = def.id;
   const params = use3DStore((s) => s.params[effectId]) ?? {};
+  // What visibleWhen rules are evaluated against — see E3DGroup's `values`.
+  const mergedValues: Record<string, unknown> = {
+    ...Object.fromEntries(def.groups.flatMap((g) => g.controls.map((c) => [c.key, c.default]))),
+    ...params,
+  };
   const setParam = use3DStore((s) => s.setParam);
   const resetEffectSettings = use3DStore((s) => s.resetEffectSettings);
   const mockupAnimation = use3DStore((s) => s.mockupAnimation || 'static');
@@ -136,6 +145,7 @@ export default function Effect3DControls({ effectId: forcedEffectId, collapsible
           group={g}
           sectionId={collapsible ? `e3d.${effectId}.${g.title}` : undefined}
           params={params}
+          values={mergedValues}
           onChange={(key, v) => setParam(effectId, key, v)}
           onReset={() => g.controls.forEach((c) => setParam(effectId, c.key, c.default))}
         />

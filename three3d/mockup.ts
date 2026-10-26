@@ -1,17 +1,20 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
+import { studioEnvironment } from './studioEnv';
+import { disposeStudioEnvironments, loadStudioEnvironment, studioEnvironmentFor, type StudioEnvironment } from './studioEnvironments';
 import type { AsciiOptions } from './ascii';
 import { isOn } from './asciiControls';
 import { fitAndCenter } from './frame';
 import { asset } from '@/lib/paths';
 import { makeCameraRig } from './cameraRig';
-import { findDevice } from './devices';
+import { findDevice, prepareDeviceModel, type ExtraScreenDef } from './devices';
 import { use3DStore } from '../store/use3DStore';
 import { useSceneStore } from '../store/useSceneStore';
 import { apply3DAnimation } from './animations';
 import { createCardVideo, seekVideoToTime } from '@/lib/videoTexture';
 import { loadGLBSource } from './gltfCache';
+import { createGeometryHinge } from './geometryHinge';
+import { clone as cloneSkinned } from 'three/examples/jsm/utils/SkeletonUtils.js';
 import {
   advancedRasterSize,
   gradientFromFill,
@@ -170,6 +173,12 @@ export function initMockup(
       uBokeh: { value: 0 },
       uPxHeight: { value: 1080 },
       uCentre: { value: new THREE.Vector2(0.5, 0.5) },
+      // Which axes the focus falloff measures distance along: 1 = active,
+      // 0 = ignored. Both active is the radial focus; disabling one leaves a
+      // straight in-focus band across the other (X only = a vertical band,
+      // Y only = a horizontal band).
+      uAxisX: { value: 1 },
+      uAxisY: { value: 1 },
       uShape: { value: 0 },        // aperture preset, see BOKEH_SHAPES
       uCA: { value: 0 },           // lateral chromatic aberration, in UV per unit radius
       uCAMode: { value: 0 },       // 0 none · 1 radial · 2 fringe · 3 horizontal
@@ -184,6 +193,7 @@ export function initMockup(
       uniform sampler2D tDiffuse;
       uniform float uStrength, uFocus, uFalloff, uAspect, uBokeh, uPxHeight;
       uniform float uShape, uCA, uCAMode, uMotion, uMotionAngle;
+      uniform float uAxisX, uAxisY;
       uniform vec2 uCentre;
       varying vec2 vUv;
       const int SAMPLES = 32;
@@ -225,6 +235,10 @@ export function initMockup(
         // circle on a non-square canvas rather than an ellipse.
         vec2 c = vUv - uCentre;
         c.x *= uAspect;
+        // Gate each axis: a disabled axis contributes no distance, so the focus
+        // falloff becomes a straight band across the axis that stays enabled.
+        c.x *= uAxisX;
+        c.y *= uAxisY;
         float d = length(c) * 2.0;
         float mask = smoothstep(uFocus, uFocus + max(uFalloff, 0.001), d);
         float radius = uStrength * mask;
@@ -386,14 +400,14 @@ export function initMockup(
   // transparent black, and the ground is a ShadowMaterial, so the contact
   // shadow survives the cut-out as the soft alpha it already is.
   let transparentBg = false;
-  function paintBackground(spec: { type: string; c1: string; c2: string; gradient?: any }) {
+  function paintBackground(spec: { type: string; c1: string; c2: string; alpha?: number; gradient?: any }) {
     const sceneState = useSceneStore.getState();
     const phase = ((sceneState.frame / Math.max(1, sceneState.duration * sceneState.fps)) % 1 + 1) % 1;
     const gradient = gradientFromFill(spec);
     const [rw, rh] = advancedRasterSize(sceneState.width, sceneState.height, gradientRasterMaxEdge(gradient));
     const key = spec.type === 'solid'
-      ? `solid|${spec.c1}`
-      : `${rw}x${rh}|${gradientSignature(gradient, phase)}`;
+      ? `solid|${spec.c1}|${spec.alpha ?? 100}`
+      : `${rw}x${rh}|${gradientSignature(gradient, phase)}|alpha:${spec.alpha ?? 100}`;
     if (key === bgKey) return;
     bgKey = key;
     if (spec.type === 'solid') {
@@ -402,18 +416,64 @@ export function initMockup(
       const ctx = bgCanvas.getContext('2d')!;
       ctx.fillStyle = spec.c1;
       ctx.fillRect(0, 0, 2, 2);
+      const alpha = Math.max(0, Math.min(100, Number(spec.alpha ?? 100))) / 100;
+      if (alpha < 1) {
+        ctx.globalCompositeOperation = 'destination-in';
+        ctx.fillStyle = `rgba(255,255,255,${alpha})`;
+        ctx.fillRect(0, 0, 2, 2);
+        ctx.globalCompositeOperation = 'source-over';
+      }
     } else {
       paintGradientCanvas(bgCanvas, gradient, rw, rh, phase);
+      const alpha = Math.max(0, Math.min(100, Number(spec.alpha ?? 100))) / 100;
+      if (alpha < 1) {
+        const ctx = bgCanvas.getContext('2d')!;
+        ctx.globalCompositeOperation = 'destination-in';
+        ctx.fillStyle = `rgba(255,255,255,${alpha})`;
+        ctx.fillRect(0, 0, bgCanvas.width, bgCanvas.height);
+        ctx.globalCompositeOperation = 'source-over';
+      }
     }
     bgTex.needsUpdate = true;
   }
   paintBackground(opts.getBgFill?.() ?? { type: 'linear', c1: '#fbfbfc', c2: '#e6e8eb' });
 
   // Room-environment map → soft, believable reflections without a real HDRI.
+  // Until the chosen studio map finishes loading this is the fallback.
   const pmrem = new THREE.PMREMGenerator(renderer);
-  const envRT = pmrem.fromScene(new RoomEnvironment(), 0.04);
+  const envRT = pmrem.fromScene(studioEnvironment(), 0.04);
   scene.environment = envRT.texture;
-  (scene as any).environmentIntensity = 1.6;
+  (scene as any).environmentIntensity = 1.0;
+
+  // ── Matte's five studio environments ─────────────────────────────────────
+  // Picking one swaps the map that lights the scene and supplies every
+  // reflection; its head/texture is copied from the Matte app itself (see
+  // three3d/studioEnvironments.ts). Loading is async, so the procedural studio
+  // above stays visible until the first map arrives — and forever if a map is
+  // missing, which keeps the stage renderable offline.
+  let activeEnvKey = '';
+  let activeStudio: StudioEnvironment | null = null;
+  let envBackgroundOn = false;
+  function syncStudioEnvironment(p: Record<string, unknown>) {
+    const preset = studioEnvironmentFor(p.lightPreset);
+    if (preset.key !== activeEnvKey) {
+      activeEnvKey = preset.key;
+      loadStudioEnvironment(renderer, preset).then((value) => {
+        // A second selection may have landed while this one was decoding.
+        if (disposed || studioEnvironmentFor(P().lightPreset).key !== preset.key) return;
+        activeStudio = value;
+        scene.environment = value.env;
+        if (envBackgroundOn) scene.background = value.background;
+      }).catch(() => { /* keep the procedural fallback */ });
+    }
+    const wantBackground = isOn(p.envBackground);
+    if (wantBackground !== envBackgroundOn) {
+      envBackgroundOn = wantBackground;
+      // The raw equirect map, not the PMREM result: the latter is a roughness
+      // chain and has no meaning as a backdrop.
+      scene.background = wantBackground ? (activeStudio?.background ?? null) : null;
+    }
+  }
 
   // Deliberately neutral and independent of the stage Background: the backdrop
   // is a framing choice, and a device's finish must not shift colour when it
@@ -456,51 +516,31 @@ export function initMockup(
   };
   const DEFAULT_FILL_POS: [number, number, number] = [-4, 2, -3];
   const DEFAULT_RIM_POS: [number, number, number] = [-2, 4, -4];
-  const LIGHT_PRESETS: Record<string, LightPreset> = {
-    // The rig as shipped. Every field is an identity so this is a true no-op.
-    'Default': {
-      key: 1, fill: 1, rim: 1, ambient: 1, env: 1,
-      keyColor: 0xffffff, fillColor: 0xffffff, rimColor: 0xffffff, ambientColor: 0xffffff,
-      az: 0, el: 0, soft: 1,
-    },
-    // A big softbox close in: the key comes down, everything else comes up, and
-    // the penumbra widens a lot. Low contrast and almost no visible shadow edge
-    // — the look a product shot gets in a white cyc.
-    'Studio Soft': {
-      key: 0.70, fill: 1.70, rim: 0.55, ambient: 1.55, env: 1.15,
-      keyColor: 0xfffaf4, fillColor: 0xf4f7ff, rimColor: 0xffffff, ambientColor: 0xfbfbff,
-      az: -8, el: 14, soft: 2.6,
-      fillPos: [-3, 3, -1.5],
-    },
-    // Almost everything off except a hard light raking from behind, which is
-    // what draws the bright outline down one edge of the device. The ambient
-    // floor has to go nearly to zero or the rim has nothing to read against.
-    'Dark Rim': {
-      key: 0.32, fill: 0.12, rim: 3.0, ambient: 0.14, env: 0.65,
-      keyColor: 0xdfe6f5, fillColor: 0x8fa4c8, rimColor: 0xeaf2ff, ambientColor: 0x9fb0cc,
-      az: 26, el: -6, soft: 0.45,
-      rimPos: [-1.4, 2.6, -6.5],
-    },
-    // The warm-key/cool-fill split. Both sides are pushed up so neither reads as
-    // a shadow — the point is two colours meeting on the body, not a bright side
-    // and a dark one.
-    'Two Tone': {
-      key: 1.05, fill: 1.85, rim: 1.25, ambient: 0.55, env: 0.95,
-      keyColor: 0xffb478, fillColor: 0x6f9dff, rimColor: 0x8fb6ff, ambientColor: 0xa8b6d8,
-      az: -20, el: 6, soft: 1.2,
-      fillPos: [-5, 1.5, -2],
-    },
-    // Low, late sun: everything warm, the key dropped towards the horizon so it
-    // rakes across the body, and a wide penumbra because a low sun through haze
-    // is a big source.
-    'Warm Glow': {
-      key: 1.15, fill: 1.05, rim: 1.10, ambient: 1.25, env: 1.05,
-      keyColor: 0xffd49a, fillColor: 0xffc08e, rimColor: 0xffd9a8, ambientColor: 0xffe8cf,
-      az: -12, el: -10, soft: 1.9,
-    },
+  // Matte does not grade a look — it swaps the image that lights the scene.
+  // Each of these is therefore an identity over the rig: the five HDRIs are the
+  // whole difference between them, exactly as they are in Matte, while the
+  // key/fill/ambient sliders stay a photographer's supplement on top.
+  const STUDIO_RIG: Omit<LightPreset, 'key' | 'fill' | 'rim' | 'ambient' | 'env'> = {
+    keyColor: 0xffffff, fillColor: 0xffffff, rimColor: 0xffffff, ambientColor: 0xffffff,
+    az: 0, el: 0, soft: 1,
   };
-  const lightPresetOf = (v: unknown): LightPreset =>
-    LIGHT_PRESETS[String(v ?? 'Default')] ?? LIGHT_PRESETS['Default'];
+  const LIGHT_PRESETS: Record<string, LightPreset> = {
+    'Studio 01': { key: 1, fill: 1, rim: 1, ambient: 1, env: 1, ...STUDIO_RIG },
+    'Studio 02': { key: 1, fill: 1, rim: 1, ambient: 1, env: 1, ...STUDIO_RIG },
+    'Studio 03': { key: 1, fill: 1, rim: 1, ambient: 1, env: 1, ...STUDIO_RIG },
+    'Studio 04': { key: 1, fill: 1, rim: 1, ambient: 1, env: 1, ...STUDIO_RIG },
+    'Studio 05': { key: 1, fill: 1, rim: 1, ambient: 1, env: 1, ...STUDIO_RIG },
+    // Projects saved before the port carry one of the old invented looks.
+    'Default': { key: 1, fill: 1, rim: 1, ambient: 1, env: 1, ...STUDIO_RIG },
+    'Studio Soft': { key: 0.70, fill: 1.70, rim: 0.55, ambient: 1.55, env: 1.15, keyColor: 0xfffaf4, fillColor: 0xf4f7ff, rimColor: 0xffffff, ambientColor: 0xfbfbff, az: -8, el: 14, soft: 2.6, fillPos: [-3, 3, -1.5] },
+    'Dark Rim': { key: 0.32, fill: 0.12, rim: 3.0, ambient: 0.14, env: 0.65, keyColor: 0xdfe6f5, fillColor: 0x8fa4c8, rimColor: 0xeaf2ff, ambientColor: 0x9fb0cc, az: 26, el: -6, soft: 0.45, rimPos: [-1.4, 2.6, -6.5] },
+    'Two Tone': { key: 1.05, fill: 1.85, rim: 1.25, ambient: 0.55, env: 0.95, keyColor: 0xffb478, fillColor: 0x6f9dff, rimColor: 0x8fb6ff, ambientColor: 0xa8b6d8, az: -20, el: 6, soft: 1.2, fillPos: [-5, 1.5, -2] },
+    'Warm Glow': { key: 1.15, fill: 1.05, rim: 1.10, ambient: 1.25, env: 1.05, keyColor: 0xffd49a, fillColor: 0xffc08e, rimColor: 0xffd9a8, ambientColor: 0xffe8cf, az: -12, el: -10, soft: 1.9 },
+  };
+  const lightPresetOf = (v: unknown): LightPreset => {
+    const raw = String(v ?? '');
+    return LIGHT_PRESETS[raw] ?? LIGHT_PRESETS['Studio 01'];
+  };
 
   // Single owner of the rig, called by both render paths. It used to be two
   // near-identical copies, and they had already drifted: only the preview one
@@ -543,8 +583,17 @@ export function initMockup(
     // rig (radius 1.5) exactly on the slider's own default of 15.
     key.shadow.radius = Math.max(0.1, (Number(p.lightSoftness ?? 15) / 10) * lp.soft);
     if ((scene as any).environmentRotation) {
-      (scene as any).environmentRotation.y = THREE.MathUtils.degToRad(ls.envRotation);
+      // Matte's two dials: yaw turns the sphere (which moves every reflection
+      // across the device), pitch raises or lowers the softbox. Animation
+      // choreography adds its own yaw on top, as it does for the key light.
+      (scene as any).environmentRotation.set(
+        THREE.MathUtils.degToRad(Number(p.envPitch ?? 0)),
+        THREE.MathUtils.degToRad(ls.envRotation + Number(p.envRotation ?? 0)),
+        0,
+      );
     }
+    // Swaps in the selected studio HDRI (and its backdrop) when it changes.
+    syncStudioEnvironment(p);
   }
 
   // Accent "window" light — same gobo-mask pattern as the Cartoon effect, so
@@ -755,7 +804,27 @@ export function initMockup(
   // gobo above) rather than a UV/shader mask: an earlier shader-based corner
   // mask relied on the mesh's raw `vUv` varying, which didn't hold for these
   // GLBs and discarded every fragment. Canvas clipping has no such dependency.
-  let screenMesh: THREE.Mesh | null = null;
+  // The primary panel's meshes. One for most devices; a list so a future
+  // device whose panel is split across multiple quads sharing a texture works
+  // the same way.
+  let screenMeshes: THREE.Mesh[] = [];
+  const PRIMARY_SCREEN_MAT = DEV?.screenMaterial ?? 'Screen';
+  // Driven by the Duo Fold slider on a rigged device — see the load callback
+  // below, which finds the clip and pauses it so `foldAction.time` scrubs a
+  // pose instead of playing back on a clock.
+  let foldMixer: THREE.AnimationMixer | null = null;
+  let foldAction: THREE.AnimationAction | null = null;
+  let foldClipDuration = 0;
+  let foldGeometry: ReturnType<typeof createGeometryHinge> | null = null;
+  const applyFold = (value: unknown) => {
+    const percent = Math.max(0, Math.min(100, Number(value ?? 100)));
+    if (foldAction && foldClipDuration > 0) {
+      const progress = percent / 100;
+      foldAction.time = (DEV?.foldAnimationReverse ? 1 - progress : progress) * foldClipDuration;
+      foldMixer!.update(0);
+    }
+    foldGeometry?.update(percent);
+  };
   let screenKey = '';
   let screenVideoEl: HTMLVideoElement | null = null;
   let screenImageEl: HTMLImageElement | null = null;
@@ -784,6 +853,8 @@ export function initMockup(
   // in the panel's own (visual) orientation; only this allocation and the
   // transform in beginScreenSpace know about the swap.
   const SCREEN_TRANSPOSE = DEV?.screenTextureTranspose ?? null;
+  const SCREEN_ROTATE180 = DEV?.screenTextureRotate180 ?? false;
+  const SCREEN_FLIP_X = DEV?.screenTextureFlipX ?? false;
 
   function ensureScreenCanvas(screenAspect: number) {
     const aspect = SCREEN_TRANSPOSE ? 1 / screenAspect : screenAspect;
@@ -802,7 +873,18 @@ export function initMockup(
   function beginScreenSpace(ctx: CanvasRenderingContext2D): { W: number; H: number } {
     const cw = screenCanvas!.width, ch = screenCanvas!.height;
     ctx.save();
-    if (!SCREEN_TRANSPOSE) return { W: cw, H: ch };
+    if (!SCREEN_TRANSPOSE) {
+      // A quad whose UVs run a half-turn off lands the content upside-down.
+      // scale(-1,-1) about the canvas centre is a true 180° rotation (both
+      // axes), which cancels it while keeping W/H — unlike flipY, which would
+      // fix only the vertical and leave the result mirrored.
+      if (SCREEN_ROTATE180) ctx.setTransform(-1, 0, 0, -1, cw, ch);
+      // A left|right mirror only — independent of (and composable with) the
+      // 180° case above, since a panel can run one axis backwards without
+      // the other.
+      else if (SCREEN_FLIP_X) ctx.setTransform(-1, 0, 0, 1, cw, 0);
+      return { W: cw, H: ch };
+    }
     // Visual space is the canvas with its axes swapped back.
     const W = ch, H = cw;
     if (SCREEN_TRANSPOSE === 'main') ctx.setTransform(0, 1, 1, 0, 0, 0);              // (x,y) -> (y,x)
@@ -1035,7 +1117,18 @@ export function initMockup(
       // laid over the display rather than some unrelated panel elsewhere.
       const ratio = area(size) / sArea;
       const offset = c.distanceTo(sCenter);
-      if (ratio > 0.8 && ratio < 1.25 && offset < Math.max(sSize.x, sSize.y) * 0.12) {
+      // ...and IN FRONT of it. A device's back panel has the same face and the
+      // same centre in x/y as its screen, and only the depth tells them apart,
+      // so a plain distance test claims the back as cover glass. That mistake
+      // is invisible on an opaque back and glaring on a transparent one: the
+      // per-frame walk drives cover glass at `envIntensity * screenGlare`, and
+      // Glare ships at 0, so the Nothing Phone's back glass was having its
+      // reflections multiplied by zero and rendered dead matte from every
+      // angle. Devices are prepared with the screen facing +Z, so the cover
+      // glass sits at or slightly above the screen's own z; the back sits a
+      // whole device-thickness below it.
+      const inFront = c.z >= sCenter.z - Math.max(1e-6, sSize.z) - modelHalf * 0.06;
+      if (ratio > 0.8 && ratio < 1.25 && offset < Math.max(sSize.x, sSize.y) * 0.12 && inFront) {
         mat.userData.isScreenGlass = true;
       }
     }
@@ -1103,31 +1196,170 @@ export function initMockup(
     mat.polygonOffsetUnits = -2;
     mat.depthTest = true;
     mat.depthWrite = true;
-    if (screenMesh) screenMesh.renderOrder = 1000;
+    for (const m of screenMeshes) m.renderOrder = 1000;
   }
 
+  // One material instance is shared by every primary-panel mesh, so the Duo's
+  // two inner quads show one continuous image (each sampling its own UV half).
   function setScreenMaterial(mat: THREE.MeshBasicMaterial) {
-    if (!screenMesh) { mat.dispose(); return; }
-    const old = screenMesh.material as THREE.Material;
-    if (old && old !== screenMesh.userData.origMaterial) old.dispose();
+    if (!screenMeshes.length) { mat.dispose(); return; }
+    disposeScreenMaterials();
     configureScreenComposite(mat);
-    screenMesh.material = mat;
+    if (DEV?.key === 'iphoneduo') console.log('DUODBG setScreenMaterial', screenMeshes.map((m) => ({ name: m.name, visible: m.visible, isSkinned: (m as any).isSkinnedMesh })), mat.map);
+    for (const m of screenMeshes) m.material = mat;
+  }
+
+  // Drop whatever composite material the panels currently share, without
+  // touching the authored one each mesh keeps in userData.
+  function disposeScreenMaterials() {
+    const seen = new Set<THREE.Material>();
+    for (const m of screenMeshes) {
+      const old = m.material as THREE.Material;
+      if (old && old !== m.userData.origMaterial && !seen.has(old)) { seen.add(old); old.dispose(); }
+    }
   }
 
   function restoreScreenMaterial() {
-    if (!screenMesh || !screenMesh.userData.origMaterial) return;
-    const old = screenMesh.material as THREE.Material;
-    if (old && old !== screenMesh.userData.origMaterial) old.dispose();
-    const source = screenMesh.userData.origMaterial as THREE.MeshStandardMaterial;
-    const fallback = new THREE.MeshBasicMaterial({
-      color: source.color?.clone() ?? new THREE.Color(0x000000),
-      map: source.map ?? null,
-      toneMapped: false,
-      transparent: true,
-      alphaTest: 0.001,
-    });
-    configureScreenComposite(fallback);
-    screenMesh.material = fallback;
+    if (!screenMeshes.length) return;
+    disposeScreenMaterials();
+    for (const m of screenMeshes) {
+      const source = m.userData.origMaterial as THREE.MeshStandardMaterial | undefined;
+      if (!source) continue;
+      const fallback = new THREE.MeshBasicMaterial({
+        color: source.color?.clone() ?? new THREE.Color(0x000000),
+        map: source.map ?? null,
+        toneMapped: false,
+        transparent: true,
+        alphaTest: 0.001,
+      });
+      configureScreenComposite(fallback);
+      m.material = fallback;
+    }
+  }
+
+  // ── Extra screens (the foldable Duo's cover panel) ───────────────────────
+  // A device may carry a second display. These are deliberately a SIMPLER
+  // pipeline than the primary panel: still images only, no status-bar overlay
+  // and no video, because the timeline clock, the seek path and the export
+  // frame-stepper all drive the single primary `screenVideoEl`. Giving a second
+  // panel its own clip would mean two clips to keep in lockstep through an
+  // export, which nothing in the UI asks for — the cover is a still.
+  //
+  // Each target owns its canvas, texture and material, so the two panels take
+  // independent uploads and neither can disturb the other.
+  interface ExtraTarget {
+    def: ExtraScreenDef;
+    meshes: THREE.Mesh[];
+    canvas: HTMLCanvasElement | null;
+    ctx: CanvasRenderingContext2D | null;
+    texture: THREE.CanvasTexture | null;
+    material: THREE.MeshBasicMaterial | null;
+    key: string;
+    imageEl: HTMLImageElement | null;
+  }
+  const extraTargets: ExtraTarget[] = (DEV?.extraScreens ?? []).map((def) => ({
+    def, meshes: [], canvas: null, ctx: null, texture: null, material: null, key: '', imageEl: null,
+  }));
+
+  function bindExtraScreens(list: THREE.Mesh[], mats: THREE.Material[]) {
+    for (const t of extraTargets) {
+      t.meshes = [];
+      for (let i = 0; i < list.length; i++) {
+        const mat = mats[i] as any;
+        if (mat.userData.partKey !== t.def.materialName) continue;
+        const m = list[i];
+        t.meshes.push(m);
+        m.userData.origMaterial = m.material;
+        ensureScreenUVs(m);
+        // The panel itself answers to Glass Exposure, same as the primary one.
+        // What it must NOT do is run markScreenGlass()'s scan for a cover
+        // shell: that looks for a mesh of about the panel's own area sitting
+        // in front of it, and on a FOLDABLE a half-sized panel is exactly the
+        // size of one half's outer shell. The cover display therefore claimed
+        // the polished titanium half it sits on as cover glass, and the
+        // per-frame walk drives cover glass at envMapIntensity * Glare with
+        // roughness pushed to 0.6 — Glare ships at 0, so that whole half
+        // rendered dead matte while the other half stayed metallic.
+        mat.userData.isScreenGlass = true;
+        m.renderOrder = 1000;
+      }
+    }
+  }
+
+  // Cover-fit `src` into the target's own panel aspect, corner-masked the same
+  // way the primary panel is. Self-contained rather than routed through
+  // beginScreenSpace(), which carries the primary device's transpose/rotate.
+  function drawExtraFrame(t: ExtraTarget, src: HTMLImageElement) {
+    const { screenAspect, screenCornerFrac } = t.def;
+    const W = 1024;
+    const H = Math.max(1, Math.round(W / screenAspect));
+    if (!t.canvas) { t.canvas = document.createElement('canvas'); t.ctx = t.canvas.getContext('2d'); }
+    if (t.canvas.width !== W || t.canvas.height !== H) { t.canvas.width = W; t.canvas.height = H; }
+    const ctx = t.ctx;
+    if (!ctx) return;
+    ctx.clearRect(0, 0, W, H);
+    ctx.save();
+    // The mirror goes on FIRST, so the corner mask below is cut in the same
+    // space the image is drawn in. Clipping before the flip leaves the mask
+    // un-mirrored while the content is mirrored, which puts the square corners
+    // against the wrong edge — the free one instead of the hinge.
+    if (t.def.screenTextureFlipX) { ctx.translate(W, 0); ctx.scale(-1, 1); }
+    const r = Math.min(W, H) * screenCornerFrac;
+    // roundRect takes its four radii clockwise from the top left. A panel
+    // butted against the hinge is square along that edge only.
+    const e = t.def.screenSharpEdge;
+    const radii: [number, number, number, number] = [
+      e === 'left' || e === 'top' ? 0 : r,        // top left
+      e === 'right' || e === 'top' ? 0 : r,       // top right
+      e === 'right' || e === 'bottom' ? 0 : r,    // bottom right
+      e === 'left' || e === 'bottom' ? 0 : r,     // bottom left
+    ];
+    ctx.beginPath();
+    ctx.roundRect(0, 0, W, H, radii);
+    ctx.clip();
+    const iw = src.naturalWidth || 1, ih = src.naturalHeight || 1;
+    const scale = Math.max(W / iw, H / ih);   // cover
+    const dw = iw * scale, dh = ih * scale;
+    ctx.drawImage(src, (W - dw) / 2, (H - dh) / 2, dw, dh);
+    ctx.restore();
+    if (t.texture) t.texture.needsUpdate = true;
+  }
+
+  function updateExtraScreens() {
+    for (const t of extraTargets) {
+      if (!t.meshes.length) continue;
+      const media = opts.getScreenMediaForSlot?.(t.def.slot) ?? null;
+      const url = media?.url && media.kind === 'image' ? media.url : '';
+      if (url === t.key) continue;
+      t.key = url;
+      if (!url) {
+        t.imageEl = null;
+        for (const m of t.meshes) if (m.userData.origMaterial) m.material = m.userData.origMaterial as THREE.Material;
+        continue;
+      }
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = () => {
+        if (disposed || t.key !== url) return;
+        t.imageEl = img;
+        drawExtraFrame(t, img);
+        if (!t.texture) {
+          t.texture = new THREE.CanvasTexture(t.canvas!);
+          t.texture.colorSpace = THREE.SRGBColorSpace;
+          t.texture.flipY = t.def.screenTextureFlipY ?? true;
+          t.texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+        }
+        t.texture.needsUpdate = true;
+        if (!t.material) {
+          t.material = makeScreenMaterial(t.texture);
+          t.material.polygonOffset = true;
+          t.material.polygonOffsetFactor = 0;
+          t.material.polygonOffsetUnits = -2;
+        }
+        for (const m of t.meshes) m.material = t.material;
+      };
+      img.src = url;
+    }
   }
 
   // ── Which materials the Finish repaints ─────────────────────────────────
@@ -1202,6 +1434,39 @@ export function initMockup(
     }
   }
 
+  // Which materials a device's Finish repaints, named outright.
+  //
+  // markEnclosureMaterials() finds a body by looking for one large, evenly
+  // coloured panel, which is what a unibody phone or tablet is. The Nothing
+  // Phone is not that: its back is a transparent-look assembly of dozens of
+  // small textured plates, and not one of them clears the panel-size gate, so
+  // the scan marked nothing and the Finish control did nothing at all.
+  //
+  // This mesh does name its materials, though, so for it the body can simply be
+  // stated. Only the parts that actually change colour between the white and
+  // black variants are listed: the plates and the frame. The camera rings, the
+  // Glyph matrix, the lenses and the screws are black on both, and naming them
+  // here would wash them out the moment a light finish was picked.
+  const ENCLOSURE_BY_MATERIAL: Record<string, string[]> = {
+    nothingphone3: ['back panel', 'back panel.001', 'frame', 'frame.001', 'logo.001', 'logo.002'],
+    // Apple Watch Ultra 3: repaint only the titanium case. The crown ring and
+    // the band ('Watch Crown Ring', 'Watch Strap') are the Ultra's orange
+    // accent — naming them here would flood that orange out the moment a finish
+    // is picked, so they stay as authored.
+    applewatchultra3: ['Watch Body', 'Watch Crown'],
+  };
+
+  function markEnclosureByMaterialName() {
+    const names = DEV ? ENCLOSURE_BY_MATERIAL[DEV.key] : undefined;
+    if (!names) return;
+    let hit = 0;
+    for (const m of materials as any[]) {
+      if (m.userData.partKey === 'Screen') continue;
+      if (names.includes(m.userData.partKey as string)) { m.userData.isEnclosure = true; hit++; }
+    }
+    if (!hit) console.warn(`[mockup] no material matched the enclosure list for ${DEV?.key}`);
+  }
+
   function markIPhoneAirRearPanelAsEnclosure() {
     if (DEV?.key !== 'iphoneair') return;
     for (let i = 0; i < meshList.length; i++) {
@@ -1234,8 +1499,25 @@ export function initMockup(
   // Keyed by material name: machine-generated, but stable inside these
   // committed assets. A name that no longer resolves is a silent no-op, so a
   // re-exported mesh degrades to today's appearance instead of throwing.
-  const MATTE_PANEL_FIXUPS: Record<string, Array<{ panel: string; copyFrom?: string }>> = {
+  const MATTE_PANEL_FIXUPS: Record<string, Array<{
+    panel: string; copyFrom?: string;
+    metalness?: number; roughness?: number; opacity?: number;
+  }>> = {
     ipadpro:   [{ panel: 'WHeurdvnNmzlaVj', copyFrom: 'AQYGetoGtanvwug' }],
+    // The Nothing Phone's back glass is authored metalness 1 / opacity 0.2.
+    // Three blends a transparent material by scaling EVERYTHING it outputs,
+    // specular included, so four fifths of its reflection was being thrown
+    // away — which is why the back read as dead matte from every angle while
+    // the camera rings, which are opaque, caught light normally.
+    //
+    // A cover glass is a dielectric, not a metal, so metalness drops to 0 and
+    // roughness to a polished 0.05. Opacity rises only as far as 0.45: the
+    // whole point of this device is the components showing through, and an
+    // opaque back would hide them.
+    nothingphone3: [
+      { panel: 'glass',     metalness: 0, roughness: 0.05, opacity: 0.45 },
+      { panel: 'glass.001', metalness: 0, roughness: 0.05, opacity: 0.45 },
+    ],
   };
 
   function repairMattePanels() {
@@ -1251,9 +1533,18 @@ export function initMockup(
         target.metalness = source.metalness;
         target.roughness = source.roughness;
       }
+      // Explicit values, for a panel with no correctly-authored sibling to copy.
+      const fx = fixes.find((f) => f.panel === panel)!;
+      if (fx.metalness !== undefined) target.metalness = fx.metalness;
+      if (fx.roughness !== undefined) target.roughness = fx.roughness;
+      if (fx.opacity !== undefined) {
+        target.opacity = fx.opacity;
+        target.transparent = fx.opacity < 1;
+      }
       // The micro-roughness noise multiplies against this baseline, so it has
       // to move with the roughness or the panel keeps the old surface response.
       if (source) target.userData.origRoughness = source.roughness;
+      if (fx.roughness !== undefined) target.userData.origRoughness = fx.roughness;
       target.needsUpdate = true;
     }
   }
@@ -1353,11 +1644,34 @@ export function initMockup(
   let model: THREE.Object3D | null = null;
 
   if (MODEL_URL) loadGLBSource(MODEL_URL).then(
-    (source) => {
+    ({ scene: source, animations }) => {
       if (disposed) return;
       // Keep the cached source pristine: this renderer fits the root and owns
       // per-instance material state, while thumbnail rendering has its own clone.
-      model = source.clone(true);
+      // A rigged source (the foldable Duo) needs SkeletonUtils' clone — the
+      // plain Object3D.clone() copies each bone as an unrelated Object3D, so
+      // the copied SkinnedMesh ends up skinned to the ORIGINAL skeleton and
+      // every instance shares one pose.
+      let hasSkinned = false;
+      source.traverse((o) => { if ((o as THREE.SkinnedMesh).isSkinnedMesh) hasSkinned = true; });
+      model = hasSkinned ? cloneSkinned(source) : source.clone(true);
+      if (hasSkinned && animations.length) {
+        foldMixer = new THREE.AnimationMixer(model);
+        const clip = animations.find((c) => c.name === DEV?.foldAnimationClip) ?? animations[0];
+        foldAction = foldMixer.clipAction(clip);
+        foldAction.play();
+        foldAction.paused = true;
+        foldClipDuration = clip.duration;
+      }
+      // Some sources (the Duo's product-viewer rig, authored lying flat for
+      // its own "drag to fold" widget; the AR Quick Look packages, exported in
+      // whichever pose Apple photographed) don't share the bundled devices' own
+      // convention of standing with the screen facing +Z. Applied to the model
+      // itself, before fitAndCenter measures it, so the user's own Rotate X/Y/Z
+      // stay zeroed at a normal starting pose. Also drops the second copy some
+      // AR packages ship, before materials are collected below.
+      prepareDeviceModel(model, DEV);
+      if (DEV?.foldGeometryHinge) foldGeometry = createGeometryHinge(model);
       const keys: string[] = [];
       model.traverse((o) => {
         const mesh = o as THREE.Mesh;
@@ -1372,6 +1686,9 @@ export function initMockup(
         // replaces — a mirror-smooth face (roughness ~0) would stay mirror
         // smooth, so the noise is mixed toward a floor instead.
         mat.userData.origRoughness = typeof mat.roughness === 'number' ? mat.roughness : 1;
+        mat.userData.origMetalness = typeof mat.metalness === 'number' ? mat.metalness : 0;
+        mat.userData.origClearcoat = typeof mat.clearcoat === 'number' ? mat.clearcoat : undefined;
+        mat.userData.origClearcoatRoughness = typeof mat.clearcoatRoughness === 'number' ? mat.clearcoatRoughness : undefined;
         mat.userData.srcRoughnessMap = mat.roughnessMap ?? null;
         mat.userData.origOpacity = typeof mat.opacity === 'number' ? mat.opacity : 1;
         mat.userData.origTransparent = !!mat.transparent;
@@ -1403,6 +1720,7 @@ export function initMockup(
       });
       repairMattePanels();
       markEnclosureMaterials();
+      markEnclosureByMaterialName();
       markIPhoneAirRearPanelAsEnclosure();
       modelHalf = fitAndCenter(model, MODEL_SIZE);
       const box = new THREE.Box3().setFromObject(model);
@@ -1410,13 +1728,17 @@ export function initMockup(
       pivot.add(model);
       computeGroupData();
       frameCamera();
-      screenMesh = meshList.find((_, i) => materials[i].userData.partKey === 'Screen') ?? null;
-      if (screenMesh) {
-        screenMesh.userData.origMaterial = screenMesh.material;
-        ensureScreenUVs(screenMesh);
-        markScreenGlass(screenMesh);
-        restoreScreenMaterial();
+      // The primary panel can be more than one mesh: the foldable Duo's inner
+      // display is a quad per half, both tagged with the same material and
+      // sharing one texture (their UVs split it left|right).
+      screenMeshes = meshList.filter((_, i) => materials[i].userData.partKey === PRIMARY_SCREEN_MAT);
+      for (const m of screenMeshes) {
+        m.userData.origMaterial = m.material;
+        ensureScreenUVs(m);
+        markScreenGlass(m);
       }
+      if (screenMeshes.length) restoreScreenMaterial();
+      bindExtraScreens(meshList, materials);
       opts.onParts?.(keys);
       canvas.dataset.modelReady = 'true';
     },
@@ -1457,6 +1779,10 @@ export function initMockup(
   // export frame — so the two can never disagree about backdrop or defocus.
   const _bufSize = new THREE.Vector2();
   function renderComposited() {
+    const bgSpec = opts.getBgFill?.();
+    if (bgSpec) paintBackground(bgSpec);
+    // Studio HDRIs may optionally be shown as the scene backdrop, but the
+    // Background panel is the stage fill and must remain visible above them.
     scene.background = transparentBg ? null : bgTex;
     const strength = Number(P().blurStrength ?? 0);
     // Chromatic aberration is a property of the LENS, not of the defocus, so it
@@ -1498,12 +1824,133 @@ export function initMockup(
     // UV origin is bottom-left; the picked point arrives in top-down viewport
     // space, so Y is stored as the user sees it and flipped here.
     blurMat.uniforms.uCentre.value.set(Number(p.blurFocusX ?? 0.5), 1 - Number(p.blurFocusY ?? 0.5));
+    blurMat.uniforms.uAxisX.value = isOn(p.blurAxisX ?? 'On') ? 1 : 0;
+    blurMat.uniforms.uAxisY.value = isOn(p.blurAxisY ?? 'On') ? 1 : 0;
     renderer.render(blurScene, blurCam);
   }
 
   const tmpColor = new THREE.Color();
   const WHITE = new THREE.Color(0xffffff);
   const finishHSL = { h: 0, s: 0, l: 0 };
+  // White USDZ overlays are used for highlights on the iPhone 17's camera
+  // lenses and front sensor. On alternate finishes they overpower the black
+  // sensor materials underneath. Keep those layered camera details dark; the
+  // much larger camera-plateau faces remain mapped to the selected finish.
+  const CAMERA_DETAIL_BY_DEVICE: Record<string, Set<string>> = {
+    iphone17ar: new Set([
+      // Rear camera rings, lens/sensor overlays and small flash/sensor pieces.
+      'CQllheNMGoeRqKm', 'QNuvwNZebttsjIy', 'UczEbbHkiMUpNtf',
+      'bVwqhrJsSxSDneW', 'mBDzTBDexXbPzFJ', 'paEiHUvTyidQYhd',
+      'LvBskfQsWtgAAmD', 'UzZTnsiAlstgWEF', 'zpLBTmyZgCuGwhG',
+      'gnfLcUrSrhGfAQN', 'foYKNxysaxLFxpA', 'wnlJMlAHaUPWnoh',
+      // Lower rear camera's separately authored white lens overlays.
+      'NKEgRFMpMROeZXo', 'PMjdrRSaQyYJhDP', 'ROSoyhXuNoyjsaC',
+      'noxRzxFVClfmaMH', 'wTyOkkZyiEuMcnJ',
+      // Front camera / Dynamic Island sensor stack and its white overlays.
+      'oNMpyZHDdamXimo', 'qyGBpiZpuMOaxzH', 'raflvAFabYAQBAS',
+      'xhqWHXMGxyLrmJS', 'NfvLuAJJotPTdeu', 'YAEOwDzKQnyNWXH',
+      'dkDrykYbYhJfbQz', 'qTpvyoIItsjGhSq', 'ycdzgpMvuBOKRZK',
+    ]),
+  };
+  // These iPhone 17 maps contain unwanted baked patterns: the full back glass,
+  // camera plateau, and flash cover. For alternate finishes, use clean
+  // finish-colored glass/plateau and a neutral silver flash. Lavender retains
+  // the source appearance exactly.
+  const REAR_GLASS_MAP_ARTIFACTS: Record<string, Set<string>> = {
+    iphone17ar: new Set([
+      'EqNFBfhiFMnbuiA', 'zOGRQQRUGujjvCX',
+      'GmNoiZgeFAHhheb', 'fqAzNdUzAloJYog',
+    ]),
+    // iPhone 17 Pro's rear glass is split across two large mapped panels.
+    iphone17proar: new Set(['gCMlCSdRJrizepS', 'vDwikmBvgqpSImF']),
+  };
+  const FLASH_DETAILS_BY_DEVICE: Record<string, Set<string>> = {
+    iphone17ar: new Set([
+      'IAlyYUNXoAaMcKp', 'cCWdABRQliCohTU', 'jQkrqwSBlrvCBge',
+      'nGfjlObzGJLLIJD', 'tcSskZZpztwdLjs',
+    ]),
+  };
+
+  // ── Finish texture grading ──────────────────────────────────────────────
+  // Matte's variants carry `textureAdjustments` alongside the diffuse colours:
+  // the body maps were baked under the ORIGINAL finish, so recolouring alone
+  // would leave the old hue in the brushed-metal gradients. Matte grades those
+  // maps in memory (Core Image semantics: brightness 0, contrast 1 and
+  // saturation 1 are identity) and caches the result; this is the same idea on
+  // a 2D canvas, cached per finish+mesh so it runs once per look, not per frame.
+  const gradedTextureCache = new Map<string, THREE.Texture>();
+  function gradeFinishTexture(
+    src: THREE.Texture,
+    adj: { exposure: number; brightness: number; contrast: number; saturation: number; hueDegrees: number },
+    cacheKey: string,
+  ): THREE.Texture {
+    const hit = gradedTextureCache.get(cacheKey);
+    if (hit) return hit;
+    const image = src.image as (CanvasImageSource & { width?: number; height?: number }) | undefined;
+    const w = Number(image?.width) || 0;
+    const h = Number(image?.height) || 0;
+    if (!image || !w || !h) return src;
+    const canvas = document.createElement('canvas');
+    canvas.width = w; canvas.height = h;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return src;
+    ctx.drawImage(image, 0, 0, w, h);
+    const imageData = ctx.getImageData(0, 0, w, h);
+    const d = imageData.data;
+    const gain = Math.pow(2, adj.exposure);
+    const hue = (adj.hueDegrees * Math.PI) / 180;
+    const cos = Math.cos(hue), sin = Math.sin(hue);
+    const clamp255 = (v: number) => (v <= 0 ? 0 : v >= 255 ? 255 : Math.round(v));
+    for (let i = 0; i < d.length; i += 4) {
+      let r = (d[i] / 255) * gain + adj.brightness;
+      let g = (d[i + 1] / 255) * gain + adj.brightness;
+      let b = (d[i + 2] / 255) * gain + adj.brightness;
+      if (adj.contrast !== 1) {
+        r = (r - 0.5) * adj.contrast + 0.5;
+        g = (g - 0.5) * adj.contrast + 0.5;
+        b = (b - 0.5) * adj.contrast + 0.5;
+      }
+      if (adj.saturation !== 1) {
+        const luma = r * 0.2126 + g * 0.7152 + b * 0.0722;
+        r = luma + (r - luma) * adj.saturation;
+        g = luma + (g - luma) * adj.saturation;
+        b = luma + (b - luma) * adj.saturation;
+      }
+      if (adj.hueDegrees) {
+        // YIQ rotation about the grey axis — the cheap, artifact-free way to
+        // shift a hue without leaving the RGB gamut at flat colours.
+        const y = 0.299 * r + 0.587 * g + 0.114 * b;
+        const ii = 0.596 * r - 0.274 * g - 0.322 * b;
+        const q = 0.211 * r - 0.523 * g + 0.312 * b;
+        const ii2 = ii * cos - q * sin;
+        const q2 = ii * sin + q * cos;
+        r = y + 0.956 * ii2 + 0.621 * q2;
+        g = y - 0.272 * ii2 - 0.647 * q2;
+        b = y - 1.106 * ii2 + 1.703 * q2;
+      }
+      d[i] = clamp255(r * 255);
+      d[i + 1] = clamp255(g * 255);
+      d[i + 2] = clamp255(b * 255);
+    }
+    ctx.putImageData(imageData, 0, 0);
+    const graded = new THREE.CanvasTexture(canvas);
+    graded.colorSpace = src.colorSpace;
+    // Every sampling detail the source had: USD textures in particular are
+    // authored with flipY off and their own wrap, and losing either would put
+    // the body map on upside-down.
+    graded.flipY = src.flipY;
+    graded.wrapS = src.wrapS;
+    graded.wrapT = src.wrapT;
+    graded.repeat.copy(src.repeat);
+    graded.offset.copy(src.offset);
+    graded.center.copy(src.center);
+    graded.rotation = src.rotation;
+    graded.anisotropy = src.anisotropy;
+    graded.needsUpdate = true;
+    gradedTextureCache.set(cacheKey, graded);
+    return graded;
+  }
+
   let lastFinishHex = '';
   function loop() {
     if (disposed) return;
@@ -1542,6 +1989,14 @@ export function initMockup(
       lastFinishHex = finishHex;
       new THREE.Color(finishHex).getHSL(finishHSL);
     }
+    // Apple's appearance layer (ported from Matte) names an exact albedo for
+    // each mesh, so when the selected finish carries that table the generic
+    // enclosure repaint below is skipped entirely — a salmon camera ring must
+    // stay salmon, not be re-hued with the frame.
+    const exactFinish = isFinished
+      ? DEV?.finishes.find((f) => f.hex.toLowerCase() === finishHex.toLowerCase())
+      : undefined;
+    const exactColors = exactFinish?.materialColors;
 
     for (let i = 0; i < materials.length; i++) {
       const m = materials[i] as any;
@@ -1549,12 +2004,53 @@ export function initMockup(
       const mkey = m.userData.partKey as string;
       if (mkey === 'Screen') continue;   // user content — own material, not device-tinted
       const partFill = partFills[mkey];
+      const isCameraDetail = !!CAMERA_DETAIL_BY_DEVICE[DEV?.key ?? '']?.has(mesh.name)
+        || !!CAMERA_DETAIL_BY_DEVICE[DEV?.key ?? '']?.has(mkey);
+      // The first finish is the mesh's authored appearance. Preserve every
+      // original camera material and map for that finish (especially Lavender);
+      // only apply the dark sensor treatment when switching to another finish.
+      const preserveCameraDetail = isCameraDetail && !!exactColors;
+      const replaceRearGlassMap = !!exactColors
+        && !!REAR_GLASS_MAP_ARTIFACTS[DEV?.key ?? '']?.has(mesh.name);
+      const preserveFlash = !!exactColors
+        && !!FLASH_DETAILS_BY_DEVICE[DEV?.key ?? '']?.has(mesh.name);
       // A phone's global colour represents its enclosure finish, not every
       // component in the GLB. Camera lenses, microphones, sensors, buttons and
       // glass must retain their authored material even when Model Materials is
       // disabled. Explicit per-part fills remain available as an intentional
       // override.
       const preservePhoneDetail = DEV?.slot === 'phone' && !m.userData.isEnclosure && !partFill;
+      // Apple's finish table is keyed by prim name; partKeyOf() falls back to
+      // the mesh name when the material has none (every USDZ here).
+      const exactHex = !preserveCameraDetail && exactColors
+        ? (exactColors[mesh.name] ?? (mkey !== mesh.name ? exactColors[mkey] : undefined))
+        : undefined;
+      // Some finishes carry their appearance in the source body texture rather
+      // than only in the material albedo. Resolve the grade by mesh/material
+      // name so textured panels (notably the iPhone 17 rear glass) follow the
+      // selected finish as well.
+      const adjustment = !preserveCameraDetail && exactFinish?.textureAdjustments
+        ? (exactFinish.textureAdjustments[mesh.name]
+          ?? (mkey !== mesh.name ? exactFinish.textureAdjustments[mkey] : undefined))
+        : undefined;
+      // Matte's `scalarValues`: some finishes also change how a panel reflects.
+      // Night Sky's Duo band is 0.8-metallic, and the 18 Pro blacks sit at 0.4.
+      const scalars = !preserveCameraDetail && exactFinish?.materialScalars
+        ? (exactFinish.materialScalars[mesh.name]
+          ?? (mkey !== mesh.name ? exactFinish.materialScalars[mkey] : undefined))
+        : undefined;
+      // Restore the authored surface whenever a finish has no override for
+      // this mesh, so switching Night Sky → Star White is not one-way.
+      if (!partFill && m.userData.origMetalness !== undefined) {
+        m.metalness = scalars?.metallic ?? (m.userData.origMetalness as number);
+        m.roughness = scalars?.roughness ?? (m.userData.origRoughness as number);
+        if (m.userData.origClearcoat !== undefined) {
+          m.clearcoat = scalars?.clearcoat ?? (m.userData.origClearcoat as number);
+        }
+        if (m.userData.origClearcoatRoughness !== undefined) {
+          m.clearcoatRoughness = scalars?.clearcoatRoughness ?? (m.userData.origClearcoatRoughness as number);
+        }
+      }
 
       if (partFill) {
         const gradient = gradientFromFill(partFill);
@@ -1565,7 +2061,21 @@ export function initMockup(
           if (m.vertexColors) { m.vertexColors = false; m.needsUpdate = true; }
           m.userData.fillHash = undefined;
         }
-        if (isFinished && m.userData.isEnclosure) {
+        if (preserveCameraDetail && exactColors) {
+          m.color.set('#050505');
+        }
+        else if (replaceRearGlassMap) {
+          m.color.set(finishHex);
+        }
+        else if (preserveFlash) {
+          m.color.copy(m.userData.origColor);
+        }
+        else if (exactHex) {
+          // The finish's own albedo, written straight onto the mesh. No hue
+          // remap: Matte already resolved every panel, ring and button.
+          m.color.set(exactHex);
+        }
+        else if (isFinished && !exactColors && m.userData.isEnclosure) {
           // Re-hue rather than flood-fill: each enclosure material keeps its own
           // lightness relative to the shipped finish, so the machined edges and
           // highlights baked into those 25 shades survive the repaint instead of
@@ -1589,18 +2099,33 @@ export function initMockup(
             Math.min(1, Math.max(0, finishHSL.l + dl * span)),
           );
         }
+        else if (exactColors) m.color.copy(m.userData.origColor);
         else if (preservePhoneDetail) m.color.copy(m.userData.origColor);
         else if (useTex) m.color.copy(m.userData.hasMap ? WHITE : m.userData.origColor);
         else m.color.copy(tmpColor);
       }
 
-      // A repainted enclosure drops its baked map: that texture carries the
-      // shipped finish's own colour, so keeping it would tint the new finish
-      // towards the old one instead of replacing it.
-      const repainted = isFinished && m.userData.isEnclosure && !partFill;
+      // Camera overlays alone drop their source map: the white maps turn the
+      // lens and sensor details pale on non-authored finishes. Other exact
+      // finish materials keep their surface maps, grading the maps when the
+      // finish supplies a replacement appearance for them. Those maps carry
+      // the metallic sheen and brightness needed by the rails and rear glass.
+      const repainted = isFinished && !exactColors && m.userData.isEnclosure && !partFill;
       const desiredMap = (partFill || repainted)
         ? null
-        : ((useTex || preservePhoneDetail) && m.userData.hasMap ? m.userData.srcMap : null);
+        : preserveCameraDetail
+          ? null
+        : replaceRearGlassMap
+          ? null
+        : preserveFlash
+          ? null
+        : exactColors
+          ? (m.userData.hasMap
+            ? (adjustment && m.userData.srcMap
+              ? gradeFinishTexture(m.userData.srcMap, adjustment, `${exactFinish!.key}|${mesh.name}`)
+              : m.userData.srcMap)
+            : null)
+          : ((useTex || preservePhoneDetail) && m.userData.hasMap ? m.userData.srcMap : null);
       if (m.map !== desiredMap) { m.map = desiredMap; m.needsUpdate = true; }
 
       if (selected && mkey === selected) { m.emissive.setRGB(0.12, 0.35, 0.6); m.emissiveIntensity = 1; }
@@ -1619,13 +2144,16 @@ export function initMockup(
         m.roughness = base + (0.6 - base) * (1 - screenGlare);
       }
 
-      // Per-group exposure. The enclosure — frame and rear panel — answers to
-      // Body Exposure; everything else the device owns (cover glass, bezel,
-      // Dynamic Island, camera rings, buttons) answers to Glass Exposure. The
-      // Screen mesh leaves this loop above, so screen content keeps its own
-      // brightness under either slider.
+      // Per-group exposure. Glass Exposure drives ONLY the cover glass (the
+      // Screen mesh and any shell detected in front of it, both flagged
+      // isScreenGlass); everything else the device owns — frame, rear panel,
+      // bezel, camera rings, buttons — answers to Body Exposure. Keyed on
+      // isScreenGlass rather than isEnclosure so it holds on devices whose
+      // enclosure scan matches nothing (e.g. iPhone 18 Pro, iPhone Duo): with
+      // the old isEnclosure test those marked no body, so Glass Exposure moved
+      // the whole device and Body Exposure moved nothing.
       if (m.userData.exposureGain) {
-        m.userData.exposureGain.value = m.userData.isEnclosure ? bodyGain : glassGain;
+        m.userData.exposureGain.value = m.userData.isScreenGlass ? glassGain : bodyGain;
       }
 
       m.wireframe = wire;
@@ -1652,7 +2180,7 @@ export function initMockup(
     const screenStatus = opts.getScreenStatus?.();
     const hasEmptyStatusScreen = DEV?.slot === 'phone' && screenStatus?.mode !== 'off';
     const mkey2 = media ? `${media.kind}|${media.url}` : hasEmptyStatusScreen ? 'empty-status-screen' : '';
-    if (screenMesh && mkey2 !== screenKey) {
+    if (screenMeshes.length && mkey2 !== screenKey) {
       screenKey = mkey2;
       if (screenVideoEl) { screenVideoEl.pause(); screenVideoEl.removeAttribute('src'); screenVideoEl.load(); screenVideoEl = null; }
       if (media || hasEmptyStatusScreen) {
@@ -1701,11 +2229,17 @@ export function initMockup(
     }
     syncScreenVideoToTimeline();
     paintScreenContent();
+    updateExtraScreens();
     // Screen Brightness — the display is unlit (MeshBasicMaterial), so no light
     // reaches it; scaling the material colour is what dims/boosts the panel.
-    if (screenMesh && screenMesh.material !== screenMesh.userData.origMaterial) {
+    {
       const sb = Math.max(0, Number(p.screenBrightness ?? 1));
-      (screenMesh.material as THREE.MeshBasicMaterial).color.setScalar(sb);
+      for (const m of screenMeshes) {
+        if (m.material !== m.userData.origMaterial) (m.material as THREE.MeshBasicMaterial).color.setScalar(sb);
+      }
+      for (const t of extraTargets) {
+        if (t.material) t.material.color.setScalar(sb);
+      }
     }
 
     const md = opts.getModel?.();
@@ -1750,14 +2284,10 @@ export function initMockup(
       Number(p.fieldOfView ?? 42),
       Number(p.lidAngle ?? 112),
     );
+    applyFold(p.foldAngle);
 
     // Dynamic studio lighting choreography synced with camera animation
     applyLightRig(p, lightState);
-
-    // Repaints only when the Background panel actually changes (keyed on the
-    // fill spec), so this is a string compare per frame, not a canvas redraw.
-    const bgSpec = opts.getBgFill?.();
-    if (bgSpec) paintBackground(bgSpec);
 
     const shadowMat = ground.material as THREE.ShadowMaterial;
     shadowMat.opacity = Math.max(0, Math.min(1, Number(p.shadowOpacity ?? 35) / 100));
@@ -1818,6 +2348,7 @@ export function initMockup(
       Number(p.fieldOfView ?? 42),
       Number(p.lidAngle ?? 112),
     );
+    applyFold(p.foldAngle);
     applyLightRig(p, lightState);
     settleGroundUnderModel();   // after the animation has posed the pivot
     rig.update();
@@ -1902,6 +2433,8 @@ export function initMockup(
     opts.onRenderer?.(null);
     opts.onCamera?.(null);
     cancelAnimationFrame(animId);
+    foldMixer?.stopAllAction();
+    foldGeometry?.dispose();
     ro.disconnect();
     canvas.removeEventListener('pointerdown', onDown);
     canvas.removeEventListener('pointerup', onUp);
@@ -1915,13 +2448,15 @@ export function initMockup(
     (ground.material as THREE.Material).dispose();
     if (screenVideoEl) { screenVideoEl.pause(); screenVideoEl.removeAttribute('src'); screenVideoEl.load(); }
     if (screenCanvasTex) screenCanvasTex.dispose();
-    if (screenMesh) {
-      const sm = screenMesh.material as THREE.Material;
-      if (sm && sm !== screenMesh.userData.origMaterial) sm.dispose();
+    disposeScreenMaterials();
+    for (const t of extraTargets) {
+      t.texture?.dispose();
+      t.material?.dispose();
     }
     for (const m of materials) m.dispose();
     // Geometry belongs to the shared parsed GLB cache. Materials are cloned
     // above and disposed here; shared geometry remains reusable on navigation.
+    disposeStudioEnvironments(renderer);
     renderer.dispose();
   };
 }

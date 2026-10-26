@@ -10,6 +10,12 @@ export const mockupGroups: ControlGroup[] = [
     controls: [
       { key: 'fieldOfView', label: 'Field of View', type: 'slider', min: 15, max: 90, step: 1, default: 42, unit: '°' },
       { key: 'lidAngle', label: 'Laptop Lid', type: 'slider', min: 3, max: 115, step: 1, default: 112, unit: '°' },
+      // iPhone Duo book fold, scrubbing the device's own rigged animation
+      // clip rather than a hand-authored hinge angle — see
+      // DeviceDef.foldAnimationClip in three3d/devices.ts. 100 = open flat,
+      // 0 = closed. Like Laptop Lid above, inert on devices with no matching
+      // clip, so it can live in the shared schema.
+      { key: 'foldAngle', label: 'Duo Fold', type: 'slider', min: 0, max: 100, step: 1, default: 100, unit: '%' },
     ],
   },
   {
@@ -29,21 +35,36 @@ export const mockupGroups: ControlGroup[] = [
     title: 'Screen',
     controls: [
       { key: 'screenBrightness', label: 'Brightness', type: 'slider', min: 0, max: 1.6, step: 0.05, default: 1 },
-      // How much of the studio environment the cover glass mirrors back. 0 by
-      // default: the room map bakes in rectangular panels, and a mirror-smooth
-      // display returns one as a hard softbox — the CG tell the reference
-      // tool's screens don't have. Raise it for a deliberate glossy look.
+      // How much of the studio environment the cover glass mirrors back.
+      // This shipped at 0 because the old RoomEnvironment map was a lit box on
+      // every side, so a mirror-smooth display returned one of its rectangular
+      // panels as a hard softbox. three3d/studioEnv.ts replaced that with a
+      // dark surround and a few placed cards, so the reflection a screen picks
+      // up now is a soft graded falloff rather than a pasted rectangle, and
+      // this slider is usable across its whole range.
+      //
+      // It stays at 0 by default all the same, for a different reason: the
+      // point of the stage is to show the artwork someone uploaded, and glare
+      // costs legibility. Raise it when the glass matters more than the UI.
       { key: 'screenGlare', label: 'Glare', type: 'slider', min: 0, max: 100, step: 1, default: 0 },
     ],
   },
   {
     title: 'Lights',
     controls: [
-      // A named look, applied as multipliers and colour shifts over the four
-      // sliders below rather than as replacement values — so the sliders keep
-      // working after a preset is chosen, and Default is a true no-op that
-      // returns the rig to exactly what it ships with.
-      { key: 'lightPreset', label: 'Lighting', type: 'select', options: ['Default', 'Studio Soft', 'Dark Rim', 'Two Tone', 'Warm Glow'], default: 'Default' },
+      // Matte's Lighting panel is a list of five real studio HDRIs, not a set
+      // of colour grades: picking one swaps the image that lights the scene and
+      // supplies every reflection on the device. These are the app's own five
+      // maps (see three3d/studioEnvironments.ts), in its own order.
+      { key: 'lightPreset', label: 'Environment', type: 'select', options: ['Studio 01', 'Studio 02', 'Studio 03', 'Studio 04', 'Studio 05'], default: 'Studio 01' },
+      // Matte exposes the sphere as two dials — "Rotate the environment
+      // horizontally (moves reflections)" and a vertical one — because a softbox
+      // on the left of a handset is a different product shot from one overhead.
+      { key: 'envRotation', label: 'Environment Rotation', type: 'slider', min: -180, max: 180, step: 1, default: 0, unit: '°' },
+      { key: 'envPitch', label: 'Environment Height', type: 'slider', min: -90, max: 90, step: 1, default: 0, unit: '°' },
+      // Matte's "Hide/Show Environment Background": the map itself behind the
+      // device, a virtual cyc wall rather than the studio backdrop panel.
+      { key: 'envBackground', label: 'Environment Background', type: 'toggle', options: ['Off', 'On'], default: 'Off' },
       // The reference tool steers its key light from a 2D "light direction"
       // pad rather than a position; these are that pad's two axes, and its
       // measured defaults (-26°, 0°). Applied as an offset on top of whatever
@@ -53,9 +74,9 @@ export const mockupGroups: ControlGroup[] = [
       // A stronger key against a lower fill/ambient floor is what actually
       // reads as "sharp" — enough contrast that the device's edges and finish
       // stay defined instead of washing into the bright backdrop.
-      { key: 'keyLight', label: 'Key Light', type: 'slider', min: 0, max: 6, step: 0.1, default: 3.2 },
-      { key: 'fillLight', label: 'Fill Light', type: 'slider', min: 0, max: 4, step: 0.1, default: 1 },
-      { key: 'ambient', label: 'Ambient', type: 'slider', min: 0, max: 3, step: 0.1, default: 0.55 },
+      { key: 'keyLight', label: 'Key Light', type: 'slider', min: 0, max: 6, step: 0.1, default: 2.2 },
+      { key: 'fillLight', label: 'Fill Light', type: 'slider', min: 0, max: 4, step: 0.1, default: 0.8 },
+      { key: 'ambient', label: 'Ambient', type: 'slider', min: 0, max: 3, step: 0.1, default: 0.35 },
       { key: 'envIntensity', label: 'Reflections', type: 'slider', min: 0, max: 3, step: 0.05, default: 1.1 },
       // How big the key light reads as a SOURCE. A small source throws a hard,
       // sharp-edged shadow; a large one (a softbox close in) throws a wide
@@ -109,6 +130,11 @@ export const mockupGroups: ControlGroup[] = [
       // Where that click landed, in viewport UV. Centre until something moves it.
       { key: 'blurFocusX', label: 'Focus X', type: 'slider', min: 0, max: 1, step: 0.01, default: 0.5 },
       { key: 'blurFocusY', label: 'Focus Y', type: 'slider', min: 0, max: 1, step: 0.01, default: 0.5 },
+      // Which axes the focus falloff measures along. Both On = the radial focus.
+      // Turn one off to keep a straight in-focus band across the axis left on
+      // (X only = vertical band, Y only = horizontal band) — a tilt-shift look.
+      { key: 'blurAxisX', label: 'Focus X Axis', type: 'toggle', options: ['On', 'Off'], default: 'On' },
+      { key: 'blurAxisY', label: 'Focus Y Axis', type: 'toggle', options: ['On', 'Off'], default: 'On' },
     ],
   },
   {

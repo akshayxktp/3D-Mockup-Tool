@@ -80,6 +80,7 @@ export default function ThreeStage3D({ effectId: forcedEffectId }: { effectId?: 
         const slot = findDevice((s.models[effectId] ?? defaultModelFor(effectId)).url)?.slot;
         return slot ? (s.screenMedia[slot] ?? null) : null;
       },
+      getScreenMediaForSlot: (slot: string) => use3DStore.getState().screenMedia[slot] ?? null,
       getScreenTransform: () => {
         const s = use3DStore.getState();
         return { fit: s.screenFit, zoom: s.screenZoom, offsetX: s.screenOffsetX, offsetY: s.screenOffsetY };
@@ -195,7 +196,13 @@ export default function ThreeStage3D({ effectId: forcedEffectId }: { effectId?: 
     : null;
   const background = backgroundGradient ? gradientCss(backgroundGradient) : bgFill.c1;
   const backgroundBlur = backgroundGradient ? backgroundGradient.softness * 24 : 0;
-  const stageStyle: React.CSSProperties = { background };
+  // Mockup paints its Background-panel fill into the WebGL canvas so renders
+  // and exports match the preview. Keep the CSS fallback for the short startup
+  // window only; a second CSS gradient layer would cover the live raster and
+  // make solid/gradient edits appear stale or behave differently from export.
+  const stageStyle: React.CSSProperties = effectId === 'mockup'
+    ? { background: 'transparent' }
+    : { background };
 
   // Same "contain" fit a <canvas>/<img> gets for free from object-fit, ported
   // to a plain div via container query units: whichever axis would overflow
@@ -222,7 +229,7 @@ export default function ThreeStage3D({ effectId: forcedEffectId }: { effectId?: 
           overflow: 'hidden',
         }}
       >
-        {backgroundBlur > 0 && (
+        {effectId !== 'mockup' && backgroundBlur > 0 && (
           <div
             aria-hidden="true"
             style={{

@@ -95,3 +95,68 @@ FONTS AND ASSETS
 Geist and Geist Mono are served through next/font. The bundled demo images under
 public/demo-ref are used for preview purposes only and are not covered by this
 project's licence.
+
+
+================================================================================
+CREATIVE COMMONS ATTRIBUTION 4.0 — bundled 3D model
+================================================================================
+
+public/3d/devices/applewatch-clean.glb is a modified copy of "Apple watch
+series 5" by atomle, distributed under the Creative Commons Attribution 4.0
+International licence (CC-BY-4.0). CC-BY requires that the credit, the licence
+and a statement of changes travel with any redistribution, so this notice has
+to remain with the file.
+
+    Title:   Apple watch series 5
+    Author:  atomle — https://sketchfab.com/atomle
+    Source:  https://sketchfab.com/3d-models/apple-watch-series-5-16950208bdf041f193c31d3b4a0ac15a
+    Licence: CC-BY-4.0 — http://creativecommons.org/licenses/by/4.0/
+
+    Changes: rotated 35 degrees about X so the watch face looks down +Z, which
+    is the orientation every other bundled device mesh is authored in; the
+    display mesh, its node and its material renamed to "Screen", which is how
+    three3d/mockup.ts finds the panel to composite onto; and that mesh's
+    unused atlas UVs dropped so ensureScreenUVs() builds the planar unwrap the
+    screen texture needs. No geometry was added or removed.
+
+
+================================================================================
+UNRESOLVED PROVENANCE — three bundled device meshes
+================================================================================
+
+*** This entry is a TODO, not a clearance. ***
+
+These three arrived without a licence, an author or a source URL:
+
+  public/3d/devices/applewatch-fabric.glb     (from an OBJ/MTL pair)
+  public/3d/devices/nothingphone3-clean.glb   (from "Arbok white 0207.glb")
+  public/3d/devices/nothingphone4apro-clean.glb
+
+The two Nothing meshes are Blender exports carrying no author or licence
+metadata of any kind, and the 4a Pro arrived as a bare source/ + textures/
+folder pair with no accompanying licence file.
+
+public/3d/devices/applewatch-fabric.glb was converted by
+scripts/_obj_to_device_glb.cjs from an OBJ/MTL pair supplied to the project
+without a licence, an author or a source URL. The MTL's own texture path
+("C:/Users/Adesh/Downloads/gps-lte__c6yo97eo67ue_og.png") shows it was
+redistributed from someone's working directory rather than from a licence-
+bearing download, and the OBJ carries none of the metadata a Sketchfab or
+similar export would.
+
+Every other bundled asset here is either covered by this project's own licence
+or attributed above. These cannot be, because nobody has recorded where they
+came from. Before this repository is redistributed, for EACH of them either:
+
+  - record the author, source and licence here, the way the CC-BY entry above
+    does, or
+  - remove the file and its DEVICES entry in three3d/devices.ts.
+
+Note that a device mesh modelled on a shipping product can carry design and
+trade-dress rights of its own, independently of whoever built the mesh; the
+attribution above settles the modeller's copyright, not the manufacturer's.
+
+Apple, Apple Watch, iPhone, iPad, MacBook and Mac are trademarks of Apple Inc.
+The bundled device meshes are third-party representations used to preview
+artwork; neither they nor this project are affiliated with or endorsed by
+Apple Inc.

@@ -4,7 +4,7 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { fitAndCenter } from '@/three3d/frame';
-import { DEVICES, type DeviceDef } from '@/three3d/devices';
+import { DEVICES, prepareDeviceModel, type DeviceDef } from '@/three3d/devices';
 import { loadGLBSource } from '@/three3d/gltfCache';
 import { asset } from '@/lib/paths';
 
@@ -81,7 +81,7 @@ function loadGLB(url: string): Promise<THREE.Group> {
   if (cached) return Promise.resolve(cached);
   const loading = glbLoading.get(resolvedUrl);
   if (loading) return loading;
-  const p = loadGLBSource(resolvedUrl).then((source) => {
+  const p = loadGLBSource(resolvedUrl).then(({ scene: source }) => {
     const model = source.clone(true);
     glbCache.set(resolvedUrl, model);
     glbLoading.delete(resolvedUrl);
@@ -227,6 +227,7 @@ export function DeviceThumb({ device }: { device: DeviceDef }) {
     const cancelScheduled = scheduleThumbWork(() => {
       loadGLB(device.modelUrl).then((model) => {
         if (cancelled) return;
+        prepareDeviceModel(model, device);
         setSrc(takeSnapshot(model, device.fitHeight, 'static', 0.3, `${device.modelUrl}|static|0.3`));
       });
     });
@@ -263,10 +264,10 @@ export function MockupAnimThumb({
   const modelRef = useRef<THREE.Group | null>(null);
   const fitHeightRef = useRef(2.077);
 
-  const getDeviceInfo = useCallback((): { url: string; fitHeight: number } => {
+  const getDeviceInfo = useCallback((): { url: string; fitHeight: number; dev: DeviceDef | undefined } => {
     const dk = deviceKey ?? 'iphone17pro';
     const dev = DEVICES.find((d: DeviceDef) => d.key === dk) ?? DEVICES[0];
-    return { url: dev?.modelUrl ?? '/3d/devices/iphone17pro-clean.glb', fitHeight: dev?.fitHeight ?? 2.077 };
+    return { url: dev?.modelUrl ?? '/3d/devices/iphone17pro-clean.glb', fitHeight: dev?.fitHeight ?? 2.077, dev };
   }, [deviceKey]);
 
   // Generate static idle snapshot (once)
@@ -277,6 +278,7 @@ export function MockupAnimThumb({
     const cancelScheduled = scheduleThumbWork(() => {
       loadGLB(info.url).then((model) => {
         if (cancelled) return;
+        prepareDeviceModel(model, info.dev);
         modelRef.current = model;
         setSrc(takeSnapshot(model, info.fitHeight, animKey, 0.3, `${info.url}|${animKey}|0.3`));
       });
